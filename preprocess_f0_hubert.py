@@ -2,7 +2,6 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 
 import librosa
-import ppgs
 import torch
 import torch.multiprocessing as mp
 from loguru import logger
@@ -14,7 +13,7 @@ sampling_rate = 22050
 hop_length = 256
 speech_encoder = "vec768l12"
 device = "cuda:0"
-f0p = "fcpe"
+f0p = "rmvpe"
 
 
 def process_one(filename, hmodel, f0p, device):
@@ -76,10 +75,6 @@ def parallel_process(filenames, num_processes, f0p, device):
             task.result()
 
 
-def preprocess_ppgs(file_paths):
-    ppgs_paths = [path.replace(".wav", ".ppg.pt") for path in file_paths]
-    ppgs.from_files_to_files(file_paths, ppgs_paths, gpu=0)
-
 
 if __name__ == "__main__":
     wav_paths = []
@@ -89,7 +84,4 @@ if __name__ == "__main__":
             wav_paths.append(file_path.strip())
 
     # preprocess f0 and hubert
-    parallel_process(wav_paths, 6, f0p, device)
-
-    # preprocess ppgs
-    preprocess_ppgs(wav_paths)
+    parallel_process(wav_paths, 4, f0p, device)

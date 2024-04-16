@@ -161,7 +161,7 @@ filelists/val.txt
 .idea/vcs.xml
 .idea/inspectionProfiles/profiles_settings.xml
 .idea/inspectionProfiles/Project_Default.xml
-pretrain/
+/workspace/pretrained_models/
 .vscode/launch.json
 
 trained/**/

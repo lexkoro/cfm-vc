@@ -20,7 +20,7 @@ class RMVPEF0Predictor(F0Predictor):
         sampling_rate=44100,
         threshold=0.05,
     ):
-        self.rmvpe = RMVPE(model_path="pretrain/rmvpe.pt", dtype=dtype, device=device)
+        self.rmvpe = RMVPE(model_path="/workspace/pretrained_models/rmvpe.pt", dtype=dtype, device=device)
         self.hop_length = hop_length
         self.f0_min = f0_min
         self.f0_max = f0_max
