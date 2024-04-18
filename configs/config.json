@@ -22,7 +22,7 @@
     "c_kl_r": 0.01,
     "use_sr": true,
     "max_speclen": 512,
-    "port": "8001",
+    "port": "64435",
     "keep_ckpts": 2,
     "all_in_mem": false,
     "vol_aug": false
@@ -38,6 +38,8 @@
     "n_mel_channels": 128,
     "mel_fmin": 0.0,
     "mel_fmax": null,
+    "min_file_length": 0.3,
+    "max_file_length": 10.0,
     "unit_interpolate_mode": "nearest"
   },
   "model": {

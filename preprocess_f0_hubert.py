@@ -81,7 +81,11 @@ if __name__ == "__main__":
     with open("/workspace/vc_train.csv", "r") as f:
         for line in f:
             file_path = line.split("|")[0]
-            wav_paths.append(file_path.strip())
+            soft_path = file_path.replace(".wav", ".soft.pt")
+            f0_path = file_path.replace(".wav", ".rmvpe.pt")
+            
+            if not os.path.exists(soft_path) and not os.path.exists(f0_path):
+                wav_paths.append(file_path.strip())
 
     # preprocess f0 and hubert
-    parallel_process(wav_paths, 4, f0p, device)
+    parallel_process(wav_paths, 6, f0p, device)

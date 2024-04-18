@@ -39,6 +39,8 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.num_mels = hparams.data.n_mel_channels
         self.mel_fmin = hparams.data.mel_fmin
         self.mel_fmax = hparams.data.mel_fmax
+        self.min_file_length = hparams.data.min_file_length * self.sampling_rate
+        self.max_file_length = hparams.data.max_file_length * self.sampling_rate
         # self.spk_map_inv = {v: k for k, v in self.spk_map.items()}
 
         random.seed(1234)
@@ -52,9 +54,9 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
     def _filter_long_files(self, audio_paths):
         filtered = []
-        max_length = 22050 * 9.0  # 10 seconds
+
         for p, speaker in audio_paths:
-            if (Path(p).stat().st_size // 2) < max_length:
+            if self.min_file_length <(Path(p).stat().st_size // 2) < self.max_file_length:
                 filtered.append([p, speaker])
 
         print("Audiopaths before filtering:", len(audio_paths))
@@ -125,11 +127,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         )
         audio_norm = audio_norm[:, : lmin * self.hop_length]
 
-        if spec.shape[1] < 30:
-            print("skip too short audio:", filename)
-            return None
-        else:
-            return c, f0, spec, audio_norm, uv, ppg
+        return c, f0, spec, audio_norm, uv, ppg
 
     def random_slice(self, c, f0, spec, audio_norm, uv, ppg):
         if spec.shape[1] > 800:
