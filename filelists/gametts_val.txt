@@ -1,2 +1,0 @@
-/home/alex/Projekte/TestData/Extended/Dexter/wav/dia_geppert_hallo_10_00.wav|0
-/home/alex/Projekte/TestData/Extended/Dexter/wav/dia_addon_erol_teach_10_02.wav|0
