@@ -2,117 +2,144 @@ import math
 
 import torch
 import torch.nn as nn
+from einops import rearrange
 
-from modules.attentions import FFN, ConditioningEncoder, MultiHeadAttention
+from modules.attentions import FFN, MultiHeadAttention
+from modules.modules import ConditionalLayerNorm, LayerNorm
 
 
-# modified from https://github.com/sh-lee-prml/HierSpeechpp/blob/main/modules.py#L390
-class DiTConVBlock(nn.Module):
-    """
-    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
-    """
+class ConditionalGroupNorm(nn.Module):
+    def __init__(self, groups, normalized_shape, context_dim):
+        super().__init__()
+        self.norm = nn.GroupNorm(groups, normalized_shape, affine=False)
+        self.context_mlp = nn.Sequential(
+            nn.SiLU(), nn.Linear(context_dim, 2 * normalized_shape)
+        )
+        self.context_mlp[1].weight.data.zero_()
+        self.context_mlp[1].bias.data.zero_()
 
+    def forward(self, x, context):
+        context = self.context_mlp(context)
+        ndims = " 1" * len(x.shape[2:])
+        context = rearrange(context, f"b c -> b c{ndims}")
+
+        scale, shift = context.chunk(2, dim=1)
+        x = self.norm(x) * (scale + 1.0) + shift
+        return x
+
+
+class Block1D(torch.nn.Module):
+    def __init__(self, dim, dim_out, groups=8, context_dim=None):
+        super().__init__()
+        self.conv1d = torch.nn.Conv1d(dim, dim_out, 3, padding=1)
+        if context_dim is None:
+            self.norm = torch.nn.GroupNorm(groups, dim_out)
+        else:
+            self.norm = ConditionalGroupNorm(groups, dim_out, context_dim)
+        self.mish = nn.Mish()
+
+    def forward(self, x, mask, utt_emb=None):
+        output = self.conv1d(x * mask)
+        if utt_emb is not None:
+            output = self.norm(output, utt_emb)
+        else:
+            output = self.norm(output)
+        output = self.mish(output)
+        return output * mask
+
+
+class ResnetBlock1D(torch.nn.Module):
+    def __init__(self, dim, dim_out, time_emb_dim, groups=8, context_dim=512):
+        super().__init__()
+        self.mlp = torch.nn.Sequential(
+            nn.Mish(), torch.nn.Linear(time_emb_dim, dim_out)
+        )
+
+        self.block1 = Block1D(dim, dim_out, groups=groups, context_dim=context_dim)
+        self.block2 = Block1D(dim_out, dim_out, groups=groups, context_dim=context_dim)
+
+        self.res_conv = (
+            torch.nn.Conv1d(dim, dim_out, 1) if dim != dim_out else torch.nn.Identity()
+        )
+
+    def forward(self, x, mask, time_emb, utt_emb=None):
+        h = self.block1(x, mask, utt_emb)
+        h += self.mlp(time_emb).unsqueeze(-1)
+        h = self.block2(h, mask, utt_emb)
+        output = h + self.res_conv(x * mask)
+        return output
+
+
+class Encoder(nn.Module):
     def __init__(
         self,
         hidden_channels,
         filter_channels,
-        num_heads,
-        kernel_size=3,
-        p_dropout=0.1,
-        utt_emb_dim=0,
+        time_channels,
+        n_heads,
+        n_layers,
+        dim_head=None,
+        kernel_size=1,
+        p_dropout=0.0,
     ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_channels, elementwise_affine=False, eps=1e-6)
-        self.attn = MultiHeadAttention(
-            hidden_channels, hidden_channels, num_heads, p_dropout=p_dropout
-        )
-        self.norm2 = nn.LayerNorm(hidden_channels, elementwise_affine=False, eps=1e-6)
-        self.cross_attn = ConditioningEncoder(
-            hidden_channels=hidden_channels,
-            n_heads=num_heads,
-            dim_head=None,
-            p_dropout=p_dropout,
-            cond_emb_dim=192,
-        )
-        self.norm3 = nn.LayerNorm(hidden_channels, elementwise_affine=False, eps=1e-6)
-        self.mlp = FFN(
-            hidden_channels,
-            hidden_channels,
-            filter_channels,
-            kernel_size,
-            p_dropout=p_dropout,
-        )
-        self.adaLN_modulation = nn.Sequential(
-            nn.Linear(utt_emb_dim, hidden_channels),
-            nn.SiLU(),
-            nn.Linear(hidden_channels, 9 * hidden_channels, bias=True),
-        )
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
 
-    def forward(self, x, c, x_mask, cond, cond_mask):
-        """
-        Args:
-            x : [batch_size, channel, time]
-            c : [batch_size, channel]
-            x_mask : [batch_size, 1, time]
-        return the same shape as x
-        """
-        x = x * x_mask
+        self.attn_layers = nn.ModuleList()
 
+        self.norm_layers_1 = nn.ModuleList()
+        self.norm_layers_2 = nn.ModuleList()
+
+        self.ffn_layers_1 = nn.ModuleList()
+
+        for i in range(self.n_layers):
+            self.attn_layers.append(
+                MultiHeadAttention(
+                    hidden_channels,
+                    hidden_channels,
+                    n_heads,
+                    dim_head=dim_head,
+                    p_dropout=p_dropout,
+                )
+            )
+            self.norm_layers_1.append(
+                ConditionalLayerNorm(hidden_channels, time_channels)
+            )
+
+            self.ffn_layers_1.append(
+                FFN(
+                    hidden_channels,
+                    hidden_channels,
+                    filter_channels,
+                    kernel_size=kernel_size,
+                    p_dropout=p_dropout,
+                )
+            )
+            self.norm_layers_2.append(
+                ConditionalLayerNorm(hidden_channels, time_channels)
+            )
+
+        self.norm = LayerNorm(hidden_channels)
+
+    def forward(self, x, x_mask, t):
         # attn mask
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
+        x = x * x_mask
 
-        (
-            shift_msa,
-            scale_msa,
-            gate_msa,
-            shift_mca,
-            scale_mca,
-            gate_mca,
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
-        ) = (
-            self.adaLN_modulation(c).unsqueeze(2).chunk(9, dim=1)
-        )  # shape: [batch_size, channel, 1]
+        for i in range(self.n_layers):
+            # self-attention
+            attn_input = self.norm_layers_1[i](x, t)
+            x = self.attn_layers[i](attn_input, attn_input, attn_mask) + x
 
-        # self attention
-        modulated_x = self.modulate(
-            self.norm1(x.transpose(1, 2)).transpose(1, 2), shift_msa, scale_msa
-        )
-        x = (
-            x
-            + gate_msa
-            * self.attn(
-                modulated_x,
-                c=modulated_x,
-                attn_mask=attn_mask,
-            )
-            * x_mask
-        )
+            # feed-forward
+            ffn_input = self.norm_layers_2[i](x, t)
+            x = self.ffn_layers_1[i](ffn_input, x_mask) + x
 
-        # cross attention
-        modulated_cross_x = self.modulate(
-            self.norm2(x.transpose(1, 2)).transpose(1, 2), shift_mca, scale_mca
-        )
-        x = (
-            x
-            + gate_mca
-            * self.cross_attn(modulated_cross_x, x_mask, cond, cond_mask)
-            * x_mask
-        )
-
-        x = x + gate_mlp * self.mlp(
-            self.modulate(
-                self.norm3(x.transpose(1, 2)).transpose(1, 2), shift_mlp, scale_mlp
-            ),
-            x_mask,
-        )
-
-        return x
-
-    @staticmethod
-    def modulate(x, shift, scale):
-        return x * (1 + scale) + shift
+        return self.norm(x * x_mask)
 
 
 class DitWrapper(nn.Module):
@@ -120,6 +147,7 @@ class DitWrapper(nn.Module):
 
     def __init__(
         self,
+        in_channels,
         hidden_channels,
         filter_channels,
         num_heads,
@@ -130,92 +158,36 @@ class DitWrapper(nn.Module):
         time_channels=0,
     ):
         super().__init__()
-        self.time_fusion = FiLMLayer(hidden_channels, time_channels)
-        self.conv_layers = nn.ModuleList(
-            [
-                ConvNeXtBlock(hidden_channels, filter_channels, utt_emb_dim)
-                for _ in range(conv_layers)
-            ]
-        )
-        self.block = DiTConVBlock(
-            hidden_channels,
-            hidden_channels,
-            num_heads,
-            kernel_size,
-            p_dropout,
-            utt_emb_dim,
+
+        self.conv_layers = nn.ModuleList([])
+
+        for _ in range(conv_layers):
+            self.conv_layers.append(
+                ResnetBlock1D(
+                    dim=in_channels,
+                    dim_out=hidden_channels,
+                    time_emb_dim=time_channels,
+                    groups=8,
+                    context_dim=utt_emb_dim,
+                )
+            )
+            in_channels = hidden_channels
+
+        self.block = Encoder(
+            hidden_channels=hidden_channels,
+            filter_channels=filter_channels,
+            time_channels=time_channels,
+            n_heads=num_heads,
+            n_layers=1,
+            kernel_size=kernel_size,
+            p_dropout=p_dropout,
         )
 
     def forward(self, x, c, t, x_mask, cond, cond_mask):
-        x = self.time_fusion(x, t) * x_mask
         for layer in self.conv_layers:
-            x = layer(x, c, x_mask)
-        x = self.block(x, c, x_mask, cond, cond_mask)
+            x = layer(x, x_mask, t, c)
+        x = self.block(x, x_mask, t)
         return x
-
-
-class FiLMLayer(nn.Module):
-    """
-    Feature-wise Linear Modulation (FiLM) layer
-    Reference: https://arxiv.org/abs/1709.07871
-    """
-
-    def __init__(self, in_channels, cond_channels):
-        super(FiLMLayer, self).__init__()
-        self.in_channels = in_channels
-        self.film = nn.Conv1d(cond_channels, in_channels * 2, 1)
-
-    def forward(self, x, c):
-        gamma, beta = torch.chunk(self.film(c.unsqueeze(2)), chunks=2, dim=1)
-        return gamma * x + beta
-
-
-class ConvNeXtBlock(nn.Module):
-    def __init__(self, in_channels, filter_channels, gin_channels):
-        super().__init__()
-        self.dwconv = nn.Conv1d(
-            in_channels, in_channels, kernel_size=7, padding=3, groups=in_channels
-        )
-        self.norm = StyleAdaptiveLayerNorm(in_channels, gin_channels)
-        self.pwconv = nn.Sequential(
-            nn.Linear(in_channels, filter_channels),
-            nn.GELU(),
-            nn.Linear(filter_channels, in_channels),
-        )
-
-    def forward(self, x, c, x_mask) -> torch.Tensor:
-        residual = x
-        x = self.dwconv(x) * x_mask
-        x = self.norm(x.transpose(1, 2), c)
-        x = self.pwconv(x).transpose(1, 2)
-        x = residual + x
-        return x * x_mask
-
-
-class StyleAdaptiveLayerNorm(nn.Module):
-    def __init__(self, in_channels, cond_channels):
-        """
-        Style Adaptive Layer Normalization (SALN) module.
-
-        Parameters:
-        in_channels: The number of channels in the input feature maps.
-        cond_channels: The number of channels in the conditioning input.
-        """
-        super(StyleAdaptiveLayerNorm, self).__init__()
-        self.in_channels = in_channels
-
-        self.saln = nn.Linear(cond_channels, in_channels * 2, 1)
-        self.norm = nn.LayerNorm(in_channels, elementwise_affine=False)
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.constant_(self.saln.bias.data[: self.in_channels], 1)
-        nn.init.constant_(self.saln.bias.data[self.in_channels :], 0)
-
-    def forward(self, x, c):
-        gamma, beta = torch.chunk(self.saln(c.unsqueeze(1)), chunks=2, dim=-1)
-        return gamma * self.norm(x) + beta
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -241,7 +213,7 @@ class TimestepEmbedding(nn.Module):
 
         self.layer = nn.Sequential(
             nn.Linear(in_channels, filter_channels),
-            nn.SiLU(inplace=True),
+            nn.SiLU(),
             nn.Linear(filter_channels, out_channels),
         )
 
@@ -267,38 +239,55 @@ class DiT(nn.Module):
         self.hidden_channels = hidden_channels
         self.out_channels = out_channels
         self.filter_channels = filter_channels
+        self.n_layers = n_layers
 
         self.time_embeddings = SinusoidalPosEmb(hidden_channels)
         self.time_mlp = TimestepEmbedding(
             hidden_channels, hidden_channels, filter_channels
         )
 
-        # in projection
-        self.in_proj = nn.Conv1d(in_channels, hidden_channels, 1)
-
-        self.blocks = nn.ModuleList(
-            [
+        self.down_blocks = nn.ModuleList()
+        self.up_blocks = nn.ModuleList()
+        for idx in range(n_layers // 2):
+            self.down_blocks.append(
                 DitWrapper(
+                    in_channels=in_channels,
                     hidden_channels=hidden_channels,
                     filter_channels=filter_channels,
                     num_heads=n_heads,
                     kernel_size=kernel_size,
                     p_dropout=dropout,
                     utt_emb_dim=utt_emb_dim,
-                    conv_layers=3,
+                    conv_layers=2,
                     time_channels=hidden_channels,
                 )
-                for _ in range(n_layers)
-            ]
-        )
+            )
+            in_channels = hidden_channels
+
+        for idx in range(n_layers // 2):
+            self.up_blocks.append(
+                DitWrapper(
+                    in_channels=hidden_channels * 2,
+                    hidden_channels=hidden_channels,
+                    filter_channels=filter_channels,
+                    num_heads=n_heads,
+                    kernel_size=kernel_size,
+                    p_dropout=dropout,
+                    utt_emb_dim=utt_emb_dim,
+                    conv_layers=2,
+                    time_channels=hidden_channels,
+                )
+            )
+
+        self.final_block = Block1D(hidden_channels, hidden_channels)
         self.final_proj = nn.Conv1d(hidden_channels, out_channels, 1)
 
-        self.initialize_weights()
+    #     self.initialize_weights()
 
-    def initialize_weights(self):
-        for block in self.blocks:
-            nn.init.constant_(block.block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.block.adaLN_modulation[-1].bias, 0)
+    # def initialize_weights(self):
+    #     for block in self.blocks:
+    #         nn.init.constant_(block.block.adaLN_modulation[-1].weight, 0)
+    #         nn.init.constant_(block.block.adaLN_modulation[-1].bias, 0)
 
     def forward(self, x, mask, mu, t, spks=None, cond=None, cond_mask=None):
         """Forward pass of the UNet1DConditional model.
@@ -320,11 +309,17 @@ class DiT(nn.Module):
         t = self.time_mlp(self.time_embeddings(t))
         x = torch.cat((x, mu), dim=1)
 
-        x = self.in_proj(x) * mask
+        skip_connections = []
+        for idx, block in enumerate(self.down_blocks):
+            x = block(x, spks, t, mask, cond, cond_mask)
+            skip_connections.append(x)
 
-        for block in self.blocks:
+        for idx, block in enumerate(self.up_blocks):
+            skip_x = skip_connections.pop()
+            x = torch.cat([x, skip_x], dim=1)
             x = block(x, spks, t, mask, cond, cond_mask)
 
+        x = self.final_block(x, mask)
         output = self.final_proj(x * mask)
 
         return output * mask

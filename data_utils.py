@@ -35,13 +35,11 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.sampling_rate = hparams.data.sampling_rate
         self.use_sr = hparams.train.use_sr
         self.spec_len = hparams.train.max_speclen
-        # self.spk_map = hparams.spk
         self.num_mels = hparams.data.n_mel_channels
         self.mel_fmin = hparams.data.mel_fmin
         self.mel_fmax = hparams.data.mel_fmax
         self.min_file_length = hparams.data.min_file_length * self.sampling_rate
         self.max_file_length = hparams.data.max_file_length * self.sampling_rate
-        # self.spk_map_inv = {v: k for k, v in self.spk_map.items()}
 
         random.seed(1234)
         random.shuffle(self.audiopaths)
@@ -56,7 +54,11 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         filtered = []
 
         for p, speaker in audio_paths:
-            if self.min_file_length <(Path(p).stat().st_size // 2) < self.max_file_length:
+            if (
+                self.min_file_length
+                < (Path(p).stat().st_size // 2)
+                < self.max_file_length
+            ):
                 filtered.append([p, speaker])
 
         print("Audiopaths before filtering:", len(audio_paths))
@@ -90,15 +92,18 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         )
         spec = torch.squeeze(spec, 0)
 
-        # load ppgs
-        ppg_path = filename.replace(".wav", ".ppg.pt")
-        ppg = torch.load(ppg_path)
-
         # load f0 and uv
         f0_path = filename.replace(".wav", ".rmvpe.pt")
         loaded_data = torch.load(f0_path)
         f0 = loaded_data["f0"].unsqueeze(0)
         uv = loaded_data["uv"]
+
+        # load ppgs
+        ppg_path = filename.replace(".wav", ".ppg.pt")
+        ppg = torch.load(ppg_path)
+        ppg = utils.repeat_expand_2d(
+            ppg.squeeze(0), f0.shape[1], mode=self.unit_interpolate_mode
+        )
 
         # load hubert
         hubert_path = filename.replace(".wav", ".soft.pt")

@@ -87,9 +87,9 @@ class FM(nn.Module):
                 hidden_channels=hidden_channels,
                 out_channels=out_channel,
                 filter_channels=hidden_channels * 4,
-                dropout=0.05,
-                n_layers=4,
-                n_heads=4,
+                dropout=0.00,
+                n_layers=6,
+                n_heads=2,
                 kernel_size=3,
                 utt_emb_dim=spk_emb_dim,
             )

@@ -6,22 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from modules import commons
-from modules.modules import AdaIN1d, ConditionalLayerNorm, FiLM
-
-
-class LayerNorm(nn.Module):
-    def __init__(self, channels, eps=1e-5):
-        super().__init__()
-        self.channels = channels
-        self.eps = eps
-
-        self.gamma = nn.Parameter(torch.ones(channels))
-        self.beta = nn.Parameter(torch.zeros(channels))
-
-    def forward(self, x):
-        x = x.transpose(1, -1)
-        x = F.layer_norm(x, (self.channels,), self.gamma, self.beta, self.eps)
-        return x.transpose(1, -1)
+from modules.modules import AdaIN1d, ConditionalLayerNorm, FiLM, LayerNorm
 
 
 class ConditioningEncoder(nn.Module):
@@ -108,7 +93,9 @@ class Decoder(nn.Module):
                     p_dropout=p_dropout,
                 )
             )
-            self.norm_layers_0.append(LayerNorm(hidden_channels))
+            self.norm_layers_0.append(
+                ConditionalLayerNorm(hidden_channels, utt_emb_dim)
+            )
             self.encdec_attn_layers.append(
                 ConditioningEncoder(
                     hidden_channels,
@@ -145,7 +132,7 @@ class Decoder(nn.Module):
         for i in range(self.n_layers):
             y = self.self_attn_layers[i](x, x, self_attn_mask)
             y = self.drop(y)
-            x = self.norm_layers_0[i](x + y)
+            x = self.norm_layers_0[i](x + y, g)
 
             y = self.encdec_attn_layers[i](x, x_mask, h, h_mask)
             y = self.drop(y)
@@ -168,8 +155,6 @@ class Encoder(nn.Module):
         dim_head=None,
         kernel_size=1,
         p_dropout=0.0,
-        window_size=4,
-        utt_emb_dim=None,
     ):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -178,7 +163,6 @@ class Encoder(nn.Module):
         self.n_layers = n_layers
         self.kernel_size = kernel_size
         self.p_dropout = p_dropout
-        self.window_size = window_size
 
         self.drop = nn.Dropout(p_dropout)
         self.attn_layers = nn.ModuleList()
@@ -198,9 +182,7 @@ class Encoder(nn.Module):
                     p_dropout=p_dropout,
                 )
             )
-            self.norm_layers_1.append(
-                ConditionalLayerNorm(hidden_channels, utt_emb_dim)
-            )
+            self.norm_layers_1.append(LayerNorm(hidden_channels))
 
             self.ffn_layers_1.append(
                 FFN(
@@ -211,11 +193,9 @@ class Encoder(nn.Module):
                     p_dropout=p_dropout,
                 )
             )
-            self.norm_layers_2.append(
-                ConditionalLayerNorm(hidden_channels, utt_emb_dim)
-            )
+            self.norm_layers_2.append(LayerNorm(hidden_channels))
 
-    def forward(self, x, x_mask, g=None):
+    def forward(self, x, x_mask):
         # attn mask
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
@@ -224,12 +204,12 @@ class Encoder(nn.Module):
             # self-attention
             y = self.attn_layers[i](x, x, attn_mask)
             y = self.drop(y)
-            x = self.norm_layers_1[i](x + y, g)
+            x = self.norm_layers_1[i](x + y)
 
             # feed-forward
             y = self.ffn_layers_1[i](x, x_mask)
             y = self.drop(y)
-            x = self.norm_layers_2[i](x + y, g)
+            x = self.norm_layers_2[i](x + y)
 
         x = x * x_mask
         return x

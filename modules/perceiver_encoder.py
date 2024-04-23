@@ -252,12 +252,12 @@ class PerceiverResampler(nn.Module):
                             use_flash=False,
                             cross_attn_include_queries=True,
                         ),
-                        RMSNorm(hidden_channels),
                         FeedForward(dim=hidden_channels, mult=ff_mult),
-                        RMSNorm(hidden_channels),
                     ]
                 )
             )
+
+        self.norm = RMSNorm(hidden_channels)
 
     def forward(self, x, x_mask=None):
         batch = x.shape[0]
@@ -274,11 +274,11 @@ class PerceiverResampler(nn.Module):
             device=x_mask.device,
         )
 
-        for attn, norm_attn, ff, norm_ff in self.layers:
-            y = attn(latents, x, mask=None)
-            latents = norm_attn(y + latents)
-            y = ff(latents)
-            latents = norm_ff(y + latents)
+        for attn, ff in self.layers:
+            latents = attn(latents, x, mask=None) + latents
+            latents = ff(latents) + latents
+
+        latents = self.norm(latents)
 
         latents = rearrange(latents, "b n d -> b d n")
 

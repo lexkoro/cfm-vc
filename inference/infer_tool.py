@@ -4,26 +4,22 @@ import io
 import json
 import logging
 import os
-import pickle
 import time
 from pathlib import Path
 
 import librosa
 import numpy as np
+import ppgs
 
 # import onnxruntime
 import soundfile
 import torch
 import torchaudio
 
-import cluster
 import utils
-from inference import slicer
 from models import SynthesizerTrn
-from modules.mel_processing import mel_spectrogram_torch
 
 # from models_cf import SynthesizerTrn
-from modules.speaker_encoder import ResNetSpeakerEncoder
 
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
@@ -132,12 +128,8 @@ class Svc(object):
         net_g_path,
         config_path,
         device=None,
-        cluster_model_path="logs/44k/kmeans_10000.pt",
-        speaker_encoder_path="logs/44k/speaker_encoder.pt",
-        feature_retrieval=False,
     ):
         self.net_g_path = net_g_path
-        self.feature_retrieval = feature_retrieval
         if device is None:
             self.dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -152,43 +144,18 @@ class Svc(object):
             if self.hps_ms.data.unit_interpolate_mode is not None
             else "left"
         )
-        self.vol_embedding = (
-            self.hps_ms.model.vol_embedding
-            if self.hps_ms.model.vol_embedding is not None
-            else False
-        )
+
+        # contentvec encoder
         self.speech_encoder = (
             self.hps_ms.model.speech_encoder
             if self.hps_ms.model.speech_encoder is not None
             else "vec768l12"
         )
-
         # load hubert and model
         self.load_model()
         self.hubert_model = utils.get_speech_encoder(
             self.speech_encoder, device=self.dev
         )
-        self.volume_extractor = utils.Volume_Extractor(self.hop_size)
-
-        if os.path.exists(cluster_model_path):
-            if self.feature_retrieval:
-                with open(cluster_model_path, "rb") as f:
-                    self.cluster_model = pickle.load(f)
-                self.big_npy = None
-            else:
-                self.cluster_model = cluster.get_cluster_model(cluster_model_path)
-        else:
-            self.feature_retrieval = False
-
-        self.speaker_encoder = ResNetSpeakerEncoder(
-            input_dim=80, proj_dim=512, log_input=True
-        )
-        checkpoint = torch.load(
-            speaker_encoder_path,
-            map_location="cpu",
-        )
-        self.speaker_encoder.load_state_dict(checkpoint)
-        self.speaker_encoder.eval()
 
         if not hasattr(self, "audio16k_resample_transform"):
             self.audio16k_resample_transform = torchaudio.transforms.Resample(
@@ -199,8 +166,6 @@ class Svc(object):
         # get model configuration
         self.net_g_ms = SynthesizerTrn(
             self.hps_ms.data.n_mel_channels,
-            self.hps_ms.train.segment_size // self.hps_ms.data.hop_length,
-            num_mel_channels=self.hps_ms.data.n_mel_channels,
             **self.hps_ms.model,
         )
         _ = utils.load_checkpoint(self.net_g_path, self.net_g_ms, None)
@@ -245,18 +210,6 @@ class Svc(object):
 
         wav = torch.from_numpy(wav).unsqueeze(0).to(self.dev)
 
-        # compute energy
-        energy = utils.audio_to_energy(
-            wav,
-            filter_length=self.hps_ms.data.filter_length,
-            n_mel_channels=self.hps_ms.data.n_mel_channels,
-            hop_length=self.hps_ms.data.hop_length,
-            win_length=self.hps_ms.data.win_length,
-            sampling_rate=self.hps_ms.data.sampling_rate,
-            mel_fmin=self.hps_ms.data.mel_fmin,
-            mel_fmax=self.hps_ms.data.mel_fmax,
-        )
-
         wav16k = self.audio16k_resample_transform(wav)[0]
 
         c = self.hubert_model.encoder(wav16k)
@@ -279,16 +232,14 @@ class Svc(object):
 
         c = c.unsqueeze(0)
         f0 = f0.unsqueeze(0)
-        energy = energy.unsqueeze(0)
 
-        return c, f0, uv, energy
+        return c, f0, uv
 
     def infer(
         self,
         tran,
         raw_path,
         target_audio_path,
-        target_speaker,
         cluster_infer_ratio=0,
         n_timesteps=2,
         f0_filter=False,
@@ -310,25 +261,6 @@ class Svc(object):
 
         # resample to target sample rate
         wav = self.audio_resample_transform(wav).squeeze(0).numpy()
-
-        # wav_tgt = self.audio_resample_transform(wav_tgt)
-
-        # speaker_embeddings = glob(f"/mnt/datasets/VC_Dataset/{speaker}/*.emb.pt")[
-        #     :20
-        # ]
-        # speaker_embeddings = [
-        #     torch.FloatTensor(torch.load(speaker_embedding))
-        #     for speaker_embedding in speaker_embeddings
-        # ]
-        # sid = torch.mean(torch.stack(speaker_embeddings), dim=0).to(self.dev)
-
-        speaker_embeddings = []
-        for f in target_audio_path:
-            speaker_embeddings.append(
-                self.speaker_encoder.compute_embedding(f).to(self.dev)
-            )
-
-        sid = torch.mean(torch.stack(speaker_embeddings), dim=0).to(self.dev)
 
         # get the root path of the file
         c_targets = []
@@ -363,11 +295,11 @@ class Svc(object):
             mels.append(mel_spec_tgt)
             mel_lengths.append(torch.LongTensor([mel_spec_tgt.shape[2]]).to(self.dev))
 
-        style_cond = self.net_g_ms.compute_conditional_latent(mels, mel_lengths, sid)
+        # compute cond latent and speaker embedding
+        speaker_embedding = self.net_g_ms.compute_conditional_latent(mels, mel_lengths)
 
-        # sid = self.avg_speaker_embeddings[speaker].unsqueeze(0).to(self.dev)
-        # sid = torch.LongTensor([int(speaker_id)]).to(self.dev).unsqueeze(0)
-        c, f0, uv, energy = self.get_unit_f0(
+        # get contentvec, f0, uv and ppg
+        c, f0, uv = self.get_unit_f0(
             wav,
             c_targets,
             tran,
@@ -377,18 +309,25 @@ class Svc(object):
             cr_threshold=cr_threshold,
         )
 
+        # Infer PPGs
+        audio = ppgs.load.audio(raw_path)
+        ppg = ppgs.from_audio(audio, ppgs.SAMPLE_RATE, gpu=0).to(self.dev)
+        ppg = utils.repeat_expand_2d(
+            ppg.squeeze(0), f0.shape[-1], self.unit_interpolate_mode
+        ).unsqueeze(0)
+
         c = c.to(self.dtype)
         f0 = f0.to(self.dtype)
         uv = uv.to(self.dtype)
+        ppg = ppg.to(self.dtype)
 
         with torch.no_grad():
             o, _ = self.net_g_ms.vc(
                 c,
-                style_cond=style_cond,
                 f0=f0,
-                g=sid,
                 uv=uv,
-                energy=energy,
+                ppgs=ppg,
+                g=speaker_embedding,
                 n_timesteps=n_timesteps,
                 temperature=temperature,
                 guidance_scale=guidance_scale,
@@ -405,21 +344,16 @@ class Svc(object):
         # unload model
         self.net_g_ms = self.net_g_ms.to("cpu")
         del self.net_g_ms
-        if hasattr(self, "enhancer"):
-            self.enhancer.enhancer = self.enhancer.enhancer.to("cpu")
-            del self.enhancer.enhancer
-            del self.enhancer
         gc.collect()
 
     def slice_inference(
         self,
         raw_audio_path,
         raw_target_audio_path,
-        target_speaker,
         tran,
         cluster_infer_ratio,
         n_timesteps=2,
-        f0_predictor="pm",
+        f0_predictor="rmvpe",
         cr_threshold=0.05,
         temperature=1.0,
         guidance_scale=0.0,
@@ -429,7 +363,6 @@ class Svc(object):
             tran,
             raw_audio_path,
             target_audio_path=raw_target_audio_path,
-            target_speaker=target_speaker,
             cluster_infer_ratio=cluster_infer_ratio,
             n_timesteps=n_timesteps,
             f0_predictor=f0_predictor,
@@ -440,81 +373,6 @@ class Svc(object):
         )
 
         return out_audio
-
-        # global_frame = 0
-        # audio = []
-        # for slice_tag, data in audio_data:
-        #     # padd
-        #     length = int(np.ceil(len(data) / audio_sr * self.target_sample))
-        #     if slice_tag:
-        #         _audio = np.zeros(length)
-        #         audio.extend(list(pad_array(_audio, length)))
-        #         global_frame += length // self.hop_size
-        #         continue
-        #     if per_size != 0:
-        #         datas = split_list_by_n(data, per_size, lg_size)
-        #     else:
-        #         datas = [data]
-        #     for k, dat in enumerate(datas):
-        #         per_length = (
-        #             int(np.ceil(len(dat) / audio_sr * self.target_sample))
-        #             if clip_seconds != 0
-        #             else length
-        #         )
-        #         if clip_seconds != 0:
-        #             print(
-        #                 f"###=====segment clip start, {round(len(dat) / audio_sr, 3)}s======"
-        #             )
-        #         # padd
-        #         pad_len = int(audio_sr * pad_seconds)
-        #         dat = np.concatenate([np.zeros([pad_len]), dat, np.zeros([pad_len])])
-        #         raw_path = io.BytesIO()
-        #         soundfile.write(raw_path, dat, audio_sr, format="wav")
-        #         raw_path.seek(0)
-
-        #         out_audio, out_sr, out_frame = self.infer(
-        #             tran,
-        #             raw_path,
-        #             target_audio_path=raw_target_audio_path,
-        #             cluster_infer_ratio=cluster_infer_ratio,
-        #             auto_predict_f0=auto_predict_f0,
-        #             noice_scale=noice_scale,
-        #             f0_predictor=f0_predictor,
-        #             cr_threshold=cr_threshold,
-        #             f0_adain_alpha=f0_adain_alpha,
-        #             loudness_envelope_adjustment=loudness_envelope_adjustment,
-        #         )
-
-        #         global_frame += out_frame
-        #         _audio = out_audio.cpu().numpy()
-        #         pad_len = int(self.target_sample * pad_seconds)
-        #         _audio = _audio[pad_len:-pad_len]
-        #         _audio = pad_array(_audio, per_length)
-        #         if lg_size != 0 and k != 0:
-        #             lg1 = (
-        #                 audio[-(lg_size_r + lg_size_c_r) : -lg_size_c_r]
-        #                 if lgr_num != 1
-        #                 else audio[-lg_size:]
-        #             )
-        #             lg2 = (
-        #                 _audio[lg_size_c_l : lg_size_c_l + lg_size_r]
-        #                 if lgr_num != 1
-        #                 else _audio[0:lg_size]
-        #             )
-        #             lg_pre = lg1 * (1 - lg) + lg2 * lg
-        #             audio = (
-        #                 audio[0 : -(lg_size_r + lg_size_c_r)]
-        #                 if lgr_num != 1
-        #                 else audio[0:-lg_size]
-        #             )
-        #             audio.extend(lg_pre)
-        #             _audio = (
-        #                 _audio[lg_size_c_l + lg_size_r :]
-        #                 if lgr_num != 1
-        #                 else _audio[lg_size:]
-        #             )
-        #         audio.extend(list(_audio))
-        # return np.array(audio)
 
 
 class RealTimeVC:

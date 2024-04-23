@@ -25,6 +25,8 @@ torch.backends.cudnn.benchmark = True
 global_step = 0
 start_time = time.time()
 
+# os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"  # set to DETAIL for runtime logging.
+
 
 class ModelEmaV2(torch.nn.Module):
     def __init__(self, model, decay=0.9999, device=None):
@@ -249,8 +251,8 @@ def train_and_evaluate(
             )
 
         with autocast(enabled=False, dtype=half_type):
-            f0_loss = F.smooth_l1_loss(f0_pred, lf0.detach())
-            loss_gen_all = diff_loss + prior_loss + f0_loss  # + reversal_loss
+            f0_loss = F.smooth_l1_loss(f0_pred, lf0.detach())  # f0 loss
+            loss_gen_all = diff_loss + prior_loss + f0_loss
 
         optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
@@ -263,7 +265,7 @@ def train_and_evaluate(
         if rank == 0:
             if global_step % hps.train.log_interval == 0:
                 lr = optim_g.param_groups[0]["lr"]
-                losses = [diff_loss, prior_loss]
+                losses = [diff_loss, prior_loss, f0_loss]
                 reference_loss = 0
                 for i in losses:
                     reference_loss += i

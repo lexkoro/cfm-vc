@@ -110,8 +110,8 @@ class ISTFTHead(nn.Module):
 
     def __init__(self, dim: int, n_fft: int, hop_length: int, padding: str = "same"):
         super().__init__()
-        out_dim = n_fft + 2
-        # self.out = torch.nn.Linear(dim, out_dim)
+
+        # self.out = nn.Linear(dim, out_dim)
         self.istft = ISTFT(
             n_fft=n_fft, hop_length=hop_length, win_length=n_fft, padding=padding
         )
@@ -127,7 +127,7 @@ class ISTFTHead(nn.Module):
         Returns:
             Tensor: Reconstructed time-domain audio signal of shape (B, T), where T is the length of the output signal.
         """
-        # x = self.out(x).transpose(1, 2)
+        x = x.float()
         mag, p = x.chunk(2, dim=1)
         mag = torch.exp(mag)
         mag = torch.clip(
@@ -135,7 +135,7 @@ class ISTFTHead(nn.Module):
         )  # safeguard to prevent excessively large magnitudes
         S = torch.polar(mag, p)
         audio = self.istft(S)
-        return audio
+        return audio.unsqueeze(1)
 
 
 class Generator(nn.Module):
@@ -151,36 +151,37 @@ class Generator(nn.Module):
 
     def __init__(
         self,
-        input_channels: int,
-        num_layers: int,
+        hparams,
     ):
         super().__init__()
 
-        self.num_layers = num_layers
-        self.input_channels = input_channels
+        self.input_channels = hparams.num_mels
+        self.upsample_rates = hparams.upsample_rates
+        self.upsample_kernel_sizes = hparams.upsample_kernel_sizes
+        self.upsample_initial_channel = hparams.upsample_initial_channel
+        self.resblock_kernel_sizes = hparams.resblock_kernel_sizes
+        self.resblock_dilation_sizes = hparams.resblock_dilation_sizes
+        self.post_n_fft = hparams.post_n_fft
+        self.post_hop_size = hparams.post_hop_size
 
-        upsample_rates = [8, 8]
-        upsample_kernel_sizes = [16, 16]
-        upsample_initial_channel = 512
-        resblock_kernel_sizes = [3, 7, 11]
-        resblock_dilation_sizes = [[1, 3, 5], [1, 3, 5], [1, 3, 5]]
-
-        self.num_kernels = len(resblock_kernel_sizes)
-        self.num_upsamples = len(upsample_rates)
-        self.post_n_fft = 32
-        self.post_hop_size = 8
+        self.num_kernels = len(self.resblock_kernel_sizes)
+        self.num_upsamples = len(self.upsample_rates)
 
         self.conv_pre = weight_norm(
-            nn.Conv1d(input_channels, upsample_initial_channel, 7, 1, padding=3)
+            nn.Conv1d(
+                self.input_channels, self.upsample_initial_channel, 7, 1, padding=3
+            )
         )
 
         self.ups = nn.ModuleList()
-        for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
+        for i, (u, k) in enumerate(
+            zip(self.upsample_rates, self.upsample_kernel_sizes)
+        ):
             self.ups.append(
                 weight_norm(
                     nn.ConvTranspose1d(
-                        upsample_initial_channel // (2**i),
-                        upsample_initial_channel // (2 ** (i + 1)),
+                        self.upsample_initial_channel // (2**i),
+                        self.upsample_initial_channel // (2 ** (i + 1)),
                         k,
                         u,
                         padding=(k - u) // 2,
@@ -190,9 +191,9 @@ class Generator(nn.Module):
 
         self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):
-            ch = upsample_initial_channel // (2 ** (i + 1))
+            ch = self.upsample_initial_channel // (2 ** (i + 1))
             for j, (k, d) in enumerate(
-                zip(resblock_kernel_sizes, resblock_dilation_sizes)
+                zip(self.resblock_kernel_sizes, self.resblock_dilation_sizes)
             ):
                 self.resblocks.append(ResBlock1(ch, k, d))
 
@@ -201,7 +202,6 @@ class Generator(nn.Module):
         )
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
-        # self.reflection_pad = torch.nn.ReflectionPad1d((1, 0))
 
         self.head = ISTFTHead(
             dim=self.post_n_fft + 2,
@@ -218,18 +218,13 @@ class Generator(nn.Module):
             nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x = self.embed(x)
-        # x = self.norm(x.transpose(1, 2))
-        # x = x.transpose(1, 2)
-        # for conv_block in self.convnext:
-        #     x = conv_block(x)
-
-        # x = self.final_layer_norm(x.transpose(1, 2))
-
+        # prenet
         x = self.conv_pre(x)
+
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, LRELU_SLOPE)
             x = self.ups[i](x)
+
             xs = None
             for j in range(self.num_kernels):
                 if xs is None:
@@ -239,7 +234,6 @@ class Generator(nn.Module):
             x = xs / self.num_kernels
 
         x = F.leaky_relu(x)
-        # x = self.reflection_pad(x)
         x = self.conv_post(x)
 
         audio_output = self.head(x)
@@ -248,9 +242,9 @@ class Generator(nn.Module):
 
     def remove_weight_norm(self):
         print("Removing weight norm...")
-        for l in self.ups:
-            remove_parametrizations(l, "weight")
-        for l in self.resblocks:
-            l.remove_weight_norm()
+        for conv in self.ups:
+            remove_parametrizations(conv, "weight")
+        for conv in self.resblocks:
+            conv.remove_weight_norm()
         remove_parametrizations(self.conv_pre, "weight")
         remove_parametrizations(self.conv_post, "weight")

@@ -100,7 +100,7 @@ class ResBlock1(torch.nn.Module):
         return x
 
     def remove_weight_norm(self):
-        for l in self.convs1:
-            remove_parametrizations(l, "weight")
-        for l in self.convs2:
-            remove_parametrizations(l, "weight")
+        for conv in self.convs1:
+            remove_parametrizations(conv, "weight")
+        for conv in self.convs2:
+            remove_parametrizations(conv, "weight")

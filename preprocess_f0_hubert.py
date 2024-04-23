@@ -84,7 +84,7 @@ if __name__ == "__main__":
             soft_path = file_path.replace(".wav", ".soft.pt")
             f0_path = file_path.replace(".wav", ".rmvpe.pt")
             
-            if not os.path.exists(soft_path) and not os.path.exists(f0_path):
+            if not os.path.exists(soft_path) or not os.path.exists(f0_path):
                 wav_paths.append(file_path.strip())
 
     # preprocess f0 and hubert
