@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from modules.attentions import FFN, MultiHeadAttention
+from modules.attentions import FFN, ConditioningEncoder, MultiHeadAttention
 from modules.modules import ConditionalLayerNorm, LayerNorm
 
 
@@ -90,13 +90,18 @@ class Encoder(nn.Module):
         self.kernel_size = kernel_size
 
         self.attn_layers = nn.ModuleList()
+        self.encdec_attn_layers = nn.ModuleList()
 
+        self.norm_layers_0 = nn.ModuleList()
         self.norm_layers_1 = nn.ModuleList()
         self.norm_layers_2 = nn.ModuleList()
 
         self.ffn_layers_1 = nn.ModuleList()
 
         for i in range(self.n_layers):
+            self.norm_layers_0.append(
+                ConditionalLayerNorm(hidden_channels, time_channels)
+            )
             self.attn_layers.append(
                 MultiHeadAttention(
                     hidden_channels,
@@ -106,10 +111,23 @@ class Encoder(nn.Module):
                     p_dropout=p_dropout,
                 )
             )
+
             self.norm_layers_1.append(
                 ConditionalLayerNorm(hidden_channels, time_channels)
             )
+            self.encdec_attn_layers.append(
+                ConditioningEncoder(
+                    hidden_channels,
+                    n_heads,
+                    dim_head=dim_head,
+                    p_dropout=p_dropout,
+                    cond_emb_dim=hidden_channels,
+                )
+            )
 
+            self.norm_layers_2.append(
+                ConditionalLayerNorm(hidden_channels, time_channels)
+            )
             self.ffn_layers_1.append(
                 FFN(
                     hidden_channels,
@@ -119,21 +137,22 @@ class Encoder(nn.Module):
                     p_dropout=p_dropout,
                 )
             )
-            self.norm_layers_2.append(
-                ConditionalLayerNorm(hidden_channels, time_channels)
-            )
 
         self.norm = LayerNorm(hidden_channels)
 
-    def forward(self, x, x_mask, t):
+    def forward(self, x, x_mask, h, h_mask, t):
         # attn mask
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
 
         for i in range(self.n_layers):
             # self-attention
-            attn_input = self.norm_layers_1[i](x, t)
+            attn_input = self.norm_layers_0[i](x, t)
             x = self.attn_layers[i](attn_input, attn_input, attn_mask) + x
+
+            # cross-attention
+            cross_input = self.norm_layers_1[i](x, t)
+            x = self.encdec_attn_layers[i](cross_input, x_mask, h, h_mask) + x
 
             # feed-forward
             ffn_input = self.norm_layers_2[i](x, t)
@@ -186,7 +205,7 @@ class DitWrapper(nn.Module):
     def forward(self, x, c, t, x_mask, cond, cond_mask):
         for layer in self.conv_layers:
             x = layer(x, x_mask, t, c)
-        x = self.block(x, x_mask, t)
+        x = self.block(x, x_mask, cond, cond_mask, t)
         return x
 
 

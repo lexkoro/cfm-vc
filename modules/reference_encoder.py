@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 
 from modules.attentions import Encoder
-from modules.mel_encoder import MelEncoder
+
+# from modules.mel_encoder import MelEncoder
+from modules.perceiver_encoder import PerceiverResampler
 
 
 class Conv1dGLU(nn.Module):
@@ -36,6 +38,7 @@ class MelStyleEncoder(nn.Module):
         in_channels=80,
         hidden_channels=192,
         utt_channels=512,
+        cond_channels=192,
         kernel_size=5,
         p_dropout=0.0,
         n_heads=2,
@@ -58,6 +61,16 @@ class MelStyleEncoder(nn.Module):
             Conv1dGLU(hidden_channels, hidden_channels, kernel_size, p_dropout),
         )
 
+        # perceiver resampler
+        self.resampler = PerceiverResampler(
+            hidden_channels=hidden_channels,
+            depth=2,
+            num_latents=32,
+            dim_head=dim_head,
+            heads=n_heads,
+            ff_mult=4,
+        )
+
         # attn
         self.attn = Encoder(
             hidden_channels=hidden_channels,
@@ -67,8 +80,10 @@ class MelStyleEncoder(nn.Module):
             dim_head=dim_head,
             kernel_size=3,
             p_dropout=0.1,
+            use_cond_norm=False,
         )
 
+        self.fc_latents = nn.Conv1d(hidden_channels, cond_channels, kernel_size=1)
         self.fc = nn.Conv1d(hidden_channels, utt_channels, kernel_size=1)
 
     def temporal_avg_pool(self, x, mask=None):
@@ -84,13 +99,16 @@ class MelStyleEncoder(nn.Module):
         # temporal
         x = self.temporal(x) * x_mask
 
+        # resampler
+        latents, latents_mask = self.resampler(x, x_mask)
         # attention
         x = self.attn(x, x_mask)
 
         # fc
-        x = self.fc(x) * x_mask
+        utt_emb = self.fc(x) * x_mask
+        latents_emb = self.fc_latents(latents) * latents_mask
 
         # temoral average pooling for utterance embedding
-        utt_emb = self.temporal_avg_pool(x, mask=x_mask)
+        utt_emb = self.temporal_avg_pool(utt_emb, mask=x_mask)
 
-        return utt_emb
+        return utt_emb, latents_emb, latents_mask

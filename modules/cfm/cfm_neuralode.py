@@ -9,7 +9,9 @@ from modules.cfm.wavenet import WaveNet
 
 
 class Wrapper(nn.Module):
-    def __init__(self, vector_field_net, mask, mu, spk, cond, cond_mask):
+    def __init__(
+        self, vector_field_net, mask, mu, spk, cond, cond_mask, guidance_scale
+    ):
         super(Wrapper, self).__init__()
         self.net = vector_field_net
         self.mask = mask
@@ -17,6 +19,7 @@ class Wrapper(nn.Module):
         self.spk = spk
         self.cond = cond
         self.cond_mask = cond_mask
+        self.guidance_scale = guidance_scale
 
     def forward(self, t, x, args):
         # NOTE: args cannot be dropped here. This function signature is strictly required by the NeuralODE class
@@ -26,11 +29,12 @@ class Wrapper(nn.Module):
             x, self.mask, self.mu, t, self.spk, self.cond, self.cond_mask
         )
 
-        # mu_avg = self.mu.mean(2, keepdims=True).expand_as(self.mu)
-        # dphi_avg = self.net(
-        #     x, self.mask, mu_avg, t, self.spk, self.cond, self.cond_mask
-        # )
-        # dphi_dt = dphi_dt + 0.2 * (dphi_dt - dphi_avg)
+        if self.guidance_scale > 0.0:
+            mu_avg = self.mu.mean(2, keepdims=True).expand_as(self.mu)
+            dphi_avg = self.net(
+                x, self.mask, mu_avg, t, self.spk, self.cond, self.cond_mask
+            )
+            dphi_dt = dphi_dt + self.guidance_scale * (dphi_dt - dphi_avg)
 
         return dphi_dt
 
@@ -111,9 +115,9 @@ class FM(nn.Module):
 
         self.criterion = torch.nn.MSELoss()
 
-    def ode_wrapper(self, mask, mu, spk, cond, cond_mask):
+    def ode_wrapper(self, mask, mu, spk, cond, cond_mask, guidance_scale=0.0):
         # self.estimator receives x, mask, mu, t, spk as arguments
-        return Wrapper(self.estimator, mask, mu, spk, cond, cond_mask)
+        return Wrapper(self.estimator, mask, mu, spk, cond, cond_mask, guidance_scale)
 
     @torch.no_grad()
     def inference(
@@ -126,12 +130,13 @@ class FM(nn.Module):
         cond=None,
         cond_mask=None,
         solver="dopri5",
+        guidance_scale=0.0,
     ):
         t_span = torch.linspace(
             0, 1, n_timesteps + 1
         )  # NOTE: n_timesteps means n+1 points in [0, 1]
         neural_ode = NeuralODE(
-            self.ode_wrapper(mask, mu, spk, cond, cond_mask),
+            self.ode_wrapper(mask, mu, spk, cond, cond_mask, guidance_scale),
             solver=solver,
             sensitivity="adjoint",
             atol=1e-5,
@@ -229,6 +234,7 @@ class ConditionalFlowMatching(FM):
         cond=None,
         cond_mask=None,
         solver="dopri5",
+        guidance_scale=0.0,
     ):
         super_class = super()
         return super_class.inference(
@@ -240,4 +246,5 @@ class ConditionalFlowMatching(FM):
             cond=cond,
             cond_mask=cond_mask,
             solver=solver,
+            guidance_scale=guidance_scale,
         )

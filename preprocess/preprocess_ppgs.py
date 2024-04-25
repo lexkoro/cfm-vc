@@ -10,4 +10,10 @@ if __name__ == "__main__":
     ppgs_paths = [path.replace(".wav", ".ppg.pt") for path in wav_paths]
 
     # compute ppgs
-    ppgs.from_files_to_files(wav_paths, ppgs_paths, gpu=0)
+    ppgs.from_files_to_files(
+        wav_paths,
+        ppgs_paths,
+        gpu=0,
+        representation="mel",
+        checkpoint="/workspace/pretrained_models/ppgs/mel-800k.pt",  # https://huggingface.co/CameronChurchwell/ppgs
+    )

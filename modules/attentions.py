@@ -3,6 +3,7 @@ import math
 import torch
 from einops import rearrange
 from torch import nn
+from torch.cuda.amp import autocast
 from torch.nn import functional as F
 
 from modules import commons
@@ -155,6 +156,8 @@ class Encoder(nn.Module):
         dim_head=None,
         kernel_size=1,
         p_dropout=0.0,
+        utt_emb_dim=0,
+        use_cond_norm=True,
     ):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -182,7 +185,11 @@ class Encoder(nn.Module):
                     p_dropout=p_dropout,
                 )
             )
-            self.norm_layers_1.append(LayerNorm(hidden_channels))
+            self.norm_layers_1.append(
+                ConditionalLayerNorm(hidden_channels, utt_emb_dim)
+                if use_cond_norm and utt_emb_dim > 0
+                else LayerNorm(hidden_channels)
+            )
 
             self.ffn_layers_1.append(
                 FFN(
@@ -193,9 +200,13 @@ class Encoder(nn.Module):
                     p_dropout=p_dropout,
                 )
             )
-            self.norm_layers_2.append(LayerNorm(hidden_channels))
+            self.norm_layers_2.append(
+                ConditionalLayerNorm(hidden_channels, utt_emb_dim)
+                if use_cond_norm and utt_emb_dim > 0
+                else LayerNorm(hidden_channels)
+            )
 
-    def forward(self, x, x_mask):
+    def forward(self, x, x_mask, g=None):
         # attn mask
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
@@ -204,12 +215,12 @@ class Encoder(nn.Module):
             # self-attention
             y = self.attn_layers[i](x, x, attn_mask)
             y = self.drop(y)
-            x = self.norm_layers_1[i](x + y)
+            x = self.norm_layers_1[i](x + y, g)
 
             # feed-forward
             y = self.ffn_layers_1[i](x, x_mask)
             y = self.drop(y)
-            x = self.norm_layers_2[i](x + y)
+            x = self.norm_layers_2[i](x + y, g)
 
         x = x * x_mask
         return x

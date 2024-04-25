@@ -237,6 +237,7 @@ class PerceiverResampler(nn.Module):
         super().__init__()
 
         # latents
+        self.num_latents = num_latents
         self.latents = nn.Parameter(torch.randn(num_latents, hidden_channels))
         nn.init.normal_(self.latents, std=0.02)
 
@@ -259,23 +260,27 @@ class PerceiverResampler(nn.Module):
 
         self.norm = RMSNorm(hidden_channels)
 
-    def forward(self, x, x_mask=None):
+    def forward(self, x, x_mask):
         batch = x.shape[0]
 
         # rearrange for perceiver
         x = rearrange(x, "b d n -> b n d")
 
         latents = repeat(self.latents, "n d -> b n d", b=batch)
+        # latents mask
         latents_mask = torch.ones(
             x.size(0),
             1,
-            32,
+            self.num_latents,
             dtype=x_mask.dtype,
             device=x_mask.device,
         )
 
+        # construct mask to pad
+        x_mask = torch.cat([latents_mask, x_mask], dim=-1).squeeze(1).bool()
+
         for attn, ff in self.layers:
-            latents = attn(latents, x, mask=None) + latents
+            latents = attn(latents, x, mask=x_mask) + latents
             latents = ff(latents) + latents
 
         latents = self.norm(latents)

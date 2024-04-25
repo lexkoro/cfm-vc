@@ -5,82 +5,6 @@ import modules.attentions as attentions
 from modules.modules import AdainResBlk1d, ConditionalLayerNorm
 
 
-class Encoder(nn.Module):
-    def __init__(
-        self,
-        hidden_channels,
-        filter_channels,
-        n_heads,
-        n_layers,
-        dim_head=None,
-        kernel_size=1,
-        p_dropout=0.0,
-        utt_emb_dim=512,
-    ):
-        super().__init__()
-        self.hidden_channels = hidden_channels
-        self.filter_channels = filter_channels
-        self.n_heads = n_heads
-        self.n_layers = n_layers
-        self.kernel_size = kernel_size
-        self.p_dropout = p_dropout
-
-        self.drop = nn.Dropout(p_dropout)
-        self.attn_layers = nn.ModuleList()
-
-        self.norm_layers_1 = nn.ModuleList()
-        self.norm_layers_2 = nn.ModuleList()
-
-        self.ffn_layers_1 = nn.ModuleList()
-
-        for i in range(self.n_layers):
-            self.attn_layers.append(
-                attentions.MultiHeadAttention(
-                    hidden_channels,
-                    hidden_channels,
-                    n_heads,
-                    dim_head=dim_head,
-                    p_dropout=p_dropout,
-                )
-            )
-            self.norm_layers_1.append(
-                ConditionalLayerNorm(hidden_channels, utt_emb_dim)
-            )
-
-            self.ffn_layers_1.append(
-                attentions.FFN(
-                    hidden_channels,
-                    hidden_channels,
-                    filter_channels,
-                    kernel_size=kernel_size,
-                    p_dropout=p_dropout,
-                    causal=True,
-                )
-            )
-            self.norm_layers_2.append(
-                ConditionalLayerNorm(hidden_channels, utt_emb_dim)
-            )
-
-    def forward(self, x, x_mask, g=None):
-        # attn mask
-        attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
-        x = x * x_mask
-
-        for i in range(self.n_layers):
-            # self-attention
-            y = self.attn_layers[i](x, x, attn_mask)
-            y = self.drop(y)
-            x = self.norm_layers_1[i](x + y, g)
-
-            # feed-forward
-            y = self.ffn_layers_1[i](x, x_mask)
-            y = self.drop(y)
-            x = self.norm_layers_2[i](x + y, g)
-
-        x = x * x_mask
-        return x
-
-
 class ConditionalEmbedding(nn.Module):
     def __init__(self, num_embeddings, d_model, style_dim=512):
         super().__init__()
@@ -105,7 +29,7 @@ class AuxDecoder(nn.Module):
         n_layers,
         n_heads,
         dim_head=None,
-        p_dropout=None,
+        p_dropout=0.0,
         utt_emb_dim=0,
     ):
         super().__init__()
@@ -117,9 +41,7 @@ class AuxDecoder(nn.Module):
             hidden_channels, hidden_channels, kernel_size=3, padding=1
         )
 
-        self.drop = nn.Dropout(p_dropout)
-
-        self.aux_decoder = Encoder(
+        self.aux_decoder = attentions.Decoder(
             hidden_channels=hidden_channels,
             filter_channels=hidden_channels * 4,
             n_heads=n_heads,
@@ -127,12 +49,13 @@ class AuxDecoder(nn.Module):
             kernel_size=kernel_size,
             dim_head=dim_head,
             utt_emb_dim=utt_emb_dim,
-            p_dropout=0.1,
+            p_dropout=p_dropout,
+            causal_ffn=True,
         )
 
         self.proj = nn.Conv1d(hidden_channels, output_channels, 1)
 
-    def forward(self, x, x_mask, aux, utt_emb):
+    def forward(self, x, x_mask, aux, cond, cond_mask, utt_emb):
         # detach x
         x = torch.detach(x)
 
@@ -141,7 +64,7 @@ class AuxDecoder(nn.Module):
         x = self.prenet(x) * x_mask
 
         # attention
-        x = self.aux_decoder(x, x_mask, utt_emb)
+        x = self.aux_decoder(x, x_mask, cond, cond_mask, utt_emb)
 
         # out projection
         x = self.proj(x) * x_mask

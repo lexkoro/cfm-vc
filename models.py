@@ -3,161 +3,10 @@ import math
 import torch
 from torch import nn
 
-import modules.attentions as attentions
 import modules.commons as commons
 from modules.cfm.cfm_neuralode import ConditionalFlowMatching
-from modules.modules import ResBlk1d
+from modules.content_encoder import ContentEncoder
 from modules.reference_encoder import MelStyleEncoder
-from modules.variance_decoder import AuxDecoder, ConditionalEmbedding
-from utils import f0_to_coarse, normalize_f0
-
-
-class ContentEncoder(nn.Module):
-    def __init__(
-        self,
-        hidden_channels,
-        n_feats,
-        ssl_dim,
-        ppgs_dim,
-        kernel_size,
-        n_layers,
-        filter_channels=None,
-        n_heads=None,
-        p_dropout=0.0,
-        utt_emb_dim=0,
-    ):
-        super().__init__()
-        self.hidden_channels = hidden_channels
-        self.kernel_size = kernel_size
-        self.n_layers = n_layers
-        self.uv_emb = nn.Embedding(2, hidden_channels)
-        self.f0_emb = ConditionalEmbedding(256, hidden_channels, style_dim=utt_emb_dim)
-
-        # ContentVec prenet
-        self.ssl_prenet = ResBlk1d(
-            dim_in=ssl_dim,
-            intermediate_dim=384,
-            dim_out=hidden_channels,
-            kernel_size=5,
-            normalize=False,
-        )
-
-        # f0 decoder
-        self.f0_decoder = AuxDecoder(
-            input_channels=1,
-            hidden_channels=hidden_channels,
-            output_channels=1,
-            kernel_size=3,
-            n_layers=6,
-            n_heads=2,
-            p_dropout=0.1,
-            utt_emb_dim=utt_emb_dim,
-        )
-
-        # ppg decoder
-        self.ppg_decoder = AuxDecoder(
-            input_channels=ppgs_dim,
-            hidden_channels=hidden_channels,
-            output_channels=hidden_channels,
-            kernel_size=3,
-            n_layers=6,
-            n_heads=2,
-            p_dropout=0.1,
-            utt_emb_dim=utt_emb_dim,
-        )
-
-        # encoder
-        self.encoder = attentions.Decoder(
-            hidden_channels=hidden_channels,
-            filter_channels=filter_channels,
-            n_heads=n_heads,
-            n_layers=6,
-            kernel_size=3,
-            p_dropout=p_dropout,
-            utt_emb_dim=utt_emb_dim,
-        )
-
-        # project to mu
-        self.proj_m = ResBlk1d(
-            dim_in=hidden_channels,
-            intermediate_dim=hidden_channels,
-            dim_out=n_feats,
-            kernel_size=3,
-            normalize=True,
-        )
-
-    def forward(
-        self,
-        x,
-        x_mask,
-        f0=None,
-        uv=None,
-        ppgs=None,
-        utt_emb=None,
-    ):
-        # prenet
-        x = self.ssl_prenet(x) * x_mask
-
-        # add uv to x
-        x = x + self.uv_emb(uv.long()).transpose(1, 2)
-
-        # ppg decoder
-        ppg_pred = self.ppg_decoder(x, x_mask, ppgs, utt_emb)
-
-        # pitch
-        lf0 = 2595.0 * torch.log10(1.0 + f0 / 700.0) / 500
-        f0_norm = normalize_f0(lf0, x_mask, uv)
-        f0_pred = self.f0_decoder(x, x_mask, f0_norm, utt_emb)
-        f0 = f0_to_coarse(f0.squeeze(1))
-        f0_emb = self.f0_emb(f0, x_mask, utt_emb)
-
-        # add f0 and ppg to x
-        aux_embeddings = +f0_emb + ppg_pred
-
-        # encode prosodic features
-        x = self.encoder(x, x_mask, aux_embeddings, x_mask, utt_emb)
-
-        # # project to mu
-        mu = self.proj_m(x) * x_mask
-
-        return mu, x_mask, f0_pred, lf0
-
-    def vc(
-        self,
-        x,
-        x_mask,
-        f0=None,
-        uv=None,
-        ppgs=None,
-        utt_emb=None,
-    ):
-        # prenet
-        x = self.ssl_prenet(x) * x_mask
-
-        # add uv to x
-        x = x + self.uv_emb(uv.long()).transpose(1, 2)
-
-        # ppg decoder
-        ppg_pred = self.ppg_decoder(x, x_mask, ppgs, utt_emb)
-
-        # pitch
-        lf0 = 2595.0 * torch.log10(1.0 + f0 / 700.0) / 500
-        f0_norm = normalize_f0(lf0, x_mask, uv)
-        f0_pred = self.f0_decoder(x, x_mask, f0_norm, utt_emb)
-        f0 = (700 * (torch.pow(10, f0_pred * 500 / 2595) - 1)).squeeze(1)
-        f0 = f0_to_coarse(f0)
-        f0_emb = self.f0_emb(f0, x_mask, utt_emb)
-
-        # add f0 and ppg to x
-        aux_embeddings = f0_emb + ppg_pred
-
-        # encode prosodic features
-        x = self.encoder(x, x_mask, aux_embeddings, x_mask, utt_emb)
-
-        # # project to mu
-        mu = self.proj_m(x) * x_mask
-
-        return mu, x_mask
 
 
 class SynthesizerTrn(nn.Module):
@@ -212,6 +61,7 @@ class SynthesizerTrn(nn.Module):
             in_channels=spec_channels,
             hidden_channels=256,
             utt_channels=speaker_embedding,
+            cond_channels=hidden_channels,
             kernel_size=5,
             p_dropout=0.1,
             n_heads=8,
@@ -237,12 +87,14 @@ class SynthesizerTrn(nn.Module):
         )
 
         # reference mel encoder
-        g = self.mel_encoder(spec, x_mask)
+        g, cond, cond_mask = self.mel_encoder(spec, x_mask)
 
         # content encoder
         mu_y, x_mask, f0_pred, lf0 = self.enc_p(
             c,
             x_mask,
+            cond=cond,
+            cond_mask=cond_mask,
             f0=f0,
             uv=uv,
             ppgs=ppgs,
@@ -251,7 +103,7 @@ class SynthesizerTrn(nn.Module):
 
         # Compute loss of score-based decoder
         diff_loss, _ = self.decoder.forward(
-            spec, None, x_mask, mu_y, spk=g, cond=None, cond_mask=None
+            spec, None, x_mask, mu_y, spk=g, cond=cond, cond_mask=cond_mask
         )
 
         prior_loss = torch.sum(
@@ -284,12 +136,14 @@ class SynthesizerTrn(nn.Module):
         )
 
         # reference mel encoder
-        g = self.mel_encoder(spec, x_mask)
+        g, cond, cond_mask = self.mel_encoder(spec, x_mask)
 
         # content encoder
         mu_y, x_mask, *_ = self.enc_p(
             c,
             x_mask,
+            cond=cond,
+            cond_mask=cond_mask,
             f0=f0,
             uv=uv,
             ppgs=ppgs,
@@ -309,8 +163,8 @@ class SynthesizerTrn(nn.Module):
             mu_y,
             n_timesteps,
             spk=g,
-            cond=None,
-            cond_mask=None,
+            cond=cond,
+            cond_mask=cond_mask,
             solver="euler",
         )
 
@@ -320,6 +174,8 @@ class SynthesizerTrn(nn.Module):
     def vc(
         self,
         c,
+        cond,
+        cond_mask,
         f0,
         uv,
         ppgs,
@@ -343,6 +199,8 @@ class SynthesizerTrn(nn.Module):
         mu_y, x_mask = self.enc_p.vc(
             c,
             x_mask,
+            cond=cond,
+            cond_mask=cond_mask,
             f0=f0,
             uv=uv,
             ppgs=ppgs,
@@ -359,29 +217,34 @@ class SynthesizerTrn(nn.Module):
             mu_y,
             n_timesteps,
             spk=g,
-            cond=None,
-            cond_mask=None,
+            cond=cond,
+            cond_mask=cond_mask,
             solver=solver,
+            guidance_scale=guidance_scale,
         )
         decoder_outputs = decoder_outputs[:, :, :y_max_length]
 
         return decoder_outputs, None
 
     @torch.no_grad()
-    def compute_conditional_latent(self, mels, mel_lengths=None):
+    def compute_conditional_latent(self, mels, mel_lengths):
         speaker_embeddings = []
+        latents_embeddings = []
         for mel, length in zip(mels, mel_lengths):
             x_mask = torch.unsqueeze(commons.sequence_mask(length, mel.size(2)), 1).to(
                 mel.dtype
             )
 
             # reference mel encoder and perceiver latents
-            speaker_embedding = self.mel_encoder(mel, x_mask)
+            speaker_embedding, cond, cond_mask = self.mel_encoder(mel, x_mask)
             speaker_embeddings.append(speaker_embedding.squeeze(0))
+            latents_embeddings.append(cond.squeeze(0))
 
-        speaker_embeddings = torch.stack(speaker_embeddings, dim=0)
+        speaker_embedding = torch.stack(speaker_embeddings, dim=0)
+        latents_embedding = torch.stack(latents_embeddings, dim=0)
 
         # mean pooling for cond_latents and speaker_embeddings
-        speaker_embeddings = speaker_embeddings.mean(dim=0, keepdim=True)
+        speaker_embedding = speaker_embedding.mean(dim=0, keepdim=True)
+        latents_embedding = latents_embedding.mean(dim=0, keepdim=True)
 
-        return speaker_embeddings
+        return speaker_embedding, latents_embedding, cond_mask

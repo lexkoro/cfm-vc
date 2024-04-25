@@ -296,7 +296,9 @@ class Svc(object):
             mel_lengths.append(torch.LongTensor([mel_spec_tgt.shape[2]]).to(self.dev))
 
         # compute cond latent and speaker embedding
-        speaker_embedding = self.net_g_ms.compute_conditional_latent(mels, mel_lengths)
+        speaker_embedding, cond, cond_mask = self.net_g_ms.compute_conditional_latent(
+            mels, mel_lengths
+        )
 
         # get contentvec, f0, uv and ppg
         c, f0, uv = self.get_unit_f0(
@@ -324,6 +326,8 @@ class Svc(object):
         with torch.no_grad():
             o, _ = self.net_g_ms.vc(
                 c,
+                cond=cond,
+                cond_mask=cond_mask,
                 f0=f0,
                 uv=uv,
                 ppgs=ppg,
