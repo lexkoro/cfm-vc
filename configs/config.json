@@ -10,7 +10,7 @@
       0.99
     ],
     "eps": 1e-09,
-    "batch_size": 16,
+    "batch_size": 32,
     "fp16_run": false,
     "half_type": "fp16",
     "lr_decay": 0.999875,
@@ -35,7 +35,7 @@
     "filter_length": 1024,
     "hop_length": 256,
     "win_length": 1024,
-    "n_mel_channels": 80,
+    "n_mel_channels": 128,
     "mel_fmin": 0,
     "mel_fmax": 8000,
     "min_file_length": 0.3,

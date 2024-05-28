@@ -40,6 +40,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.mel_fmax = hparams.data.mel_fmax
         self.min_file_length = hparams.data.min_file_length * self.sampling_rate
         self.max_file_length = hparams.data.max_file_length * self.sampling_rate
+        self.num_frames = int(4 * self.sampling_rate // self.hop_length)
 
         random.seed(1234)
         random.shuffle(self.audiopaths)
@@ -135,9 +136,9 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         return c, f0, spec, audio_norm, uv, ppg
 
     def random_slice(self, c, f0, spec, audio_norm, uv, ppg):
-        if spec.shape[1] > 800:
-            start = random.randint(0, spec.shape[1] - 800)
-            end = start + 790
+        if spec.shape[1] > self.num_frames:
+            start = random.randint(0, spec.shape[1] - self.num_frames)
+            end = start + self.num_frames - 1
             spec, c, f0, uv, ppg = (
                 spec[:, start:end],
                 c[:, start:end],
