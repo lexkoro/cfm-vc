@@ -236,6 +236,7 @@ class RotaryEmbedding(nn.Module):
     def device(self):
         return next(self.buffers()).device
 
+    @autocast(enabled=False)
     def forward(self, seq_len):
         t = torch.arange(seq_len, device=self.device).type_as(self.inv_freq)
         freqs = torch.einsum("i , j -> i j", t, self.inv_freq)
@@ -248,6 +249,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+@autocast(enabled=False)
 def apply_rotary_pos_emb(pos, t):
     return (t * pos.cos()) + (rotate_half(t) * pos.sin())
 

@@ -139,8 +139,8 @@ class FM(nn.Module):
             self.ode_wrapper(mask, mu, spk, cond, cond_mask, guidance_scale),
             solver=solver,
             sensitivity="adjoint",
-            atol=1e-5,
-            rtol=1e-5,
+            atol=1e-4,
+            rtol=1e-4,
         )
 
         x = z

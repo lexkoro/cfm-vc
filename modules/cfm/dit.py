@@ -70,6 +70,28 @@ class ResnetBlock1D(torch.nn.Module):
         return output
 
 
+class ConvNeXtBlock(nn.Module):
+    def __init__(self, in_channels, filter_channels, gin_channels):
+        super().__init__()
+        self.dwconv = nn.Conv1d(
+            in_channels, in_channels, kernel_size=7, padding=3, groups=in_channels
+        )
+        self.norm = ConditionalLayerNorm(in_channels, gin_channels)
+        self.pwconv = nn.Sequential(
+            nn.Linear(in_channels, filter_channels),
+            nn.GELU(),
+            nn.Linear(filter_channels, in_channels),
+        )
+
+    def forward(self, x, c, x_mask) -> torch.Tensor:
+        residual = x
+        x = self.dwconv(x) * x_mask
+        x = self.norm(x, c).transpose(1, 2)
+        x = self.pwconv(x).transpose(1, 2)
+        x = residual + x
+        return x * x_mask
+
+
 class Encoder(nn.Module):
     def __init__(
         self,
@@ -90,11 +112,9 @@ class Encoder(nn.Module):
         self.kernel_size = kernel_size
 
         self.attn_layers = nn.ModuleList()
-        self.encdec_attn_layers = nn.ModuleList()
 
         self.norm_layers_0 = nn.ModuleList()
         self.norm_layers_1 = nn.ModuleList()
-        self.norm_layers_2 = nn.ModuleList()
 
         self.ffn_layers_1 = nn.ModuleList()
 
@@ -115,19 +135,6 @@ class Encoder(nn.Module):
             self.norm_layers_1.append(
                 ConditionalLayerNorm(hidden_channels, time_channels)
             )
-            self.encdec_attn_layers.append(
-                ConditioningEncoder(
-                    hidden_channels,
-                    n_heads,
-                    dim_head=dim_head,
-                    p_dropout=p_dropout,
-                    cond_emb_dim=hidden_channels,
-                )
-            )
-
-            self.norm_layers_2.append(
-                ConditionalLayerNorm(hidden_channels, time_channels)
-            )
             self.ffn_layers_1.append(
                 FFN(
                     hidden_channels,
@@ -140,7 +147,7 @@ class Encoder(nn.Module):
 
         self.norm = LayerNorm(hidden_channels)
 
-    def forward(self, x, x_mask, h, h_mask, t):
+    def forward(self, x, x_mask, t):
         # attn mask
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
@@ -150,20 +157,14 @@ class Encoder(nn.Module):
             attn_input = self.norm_layers_0[i](x, t)
             x = self.attn_layers[i](attn_input, attn_input, attn_mask) + x
 
-            # cross-attention
-            cross_input = self.norm_layers_1[i](x, t)
-            x = self.encdec_attn_layers[i](cross_input, x_mask, h, h_mask) + x
-
             # feed-forward
-            ffn_input = self.norm_layers_2[i](x, t)
+            ffn_input = self.norm_layers_1[i](x, t)
             x = self.ffn_layers_1[i](ffn_input, x_mask) + x
 
         return self.norm(x * x_mask)
 
 
 class DitWrapper(nn.Module):
-    """add FiLM layer to condition time embedding to DiT"""
-
     def __init__(
         self,
         in_channels,
@@ -173,25 +174,25 @@ class DitWrapper(nn.Module):
         kernel_size=3,
         p_dropout=0.1,
         utt_emb_dim=0,
-        conv_layers=3,
         time_channels=0,
     ):
         super().__init__()
 
-        self.conv_layers = nn.ModuleList([])
+        # resnet block
+        self.resnet = ResnetBlock1D(
+            dim=in_channels,
+            dim_out=hidden_channels,
+            time_emb_dim=time_channels,
+            groups=8,
+            context_dim=utt_emb_dim,
+        )
 
-        for _ in range(conv_layers):
-            self.conv_layers.append(
-                ResnetBlock1D(
-                    dim=in_channels,
-                    dim_out=hidden_channels,
-                    time_emb_dim=time_channels,
-                    groups=8,
-                    context_dim=utt_emb_dim,
-                )
-            )
-            in_channels = hidden_channels
+        # conv layers
+        self.conv1 = ConvNeXtBlock(hidden_channels, filter_channels, utt_emb_dim)
+        self.conv2 = ConvNeXtBlock(hidden_channels, filter_channels, utt_emb_dim)
+        self.conv3 = ConvNeXtBlock(hidden_channels, filter_channels, utt_emb_dim)
 
+        # encoder
         self.block = Encoder(
             hidden_channels=hidden_channels,
             filter_channels=filter_channels,
@@ -202,10 +203,12 @@ class DitWrapper(nn.Module):
             p_dropout=p_dropout,
         )
 
-    def forward(self, x, c, t, x_mask, cond, cond_mask):
-        for layer in self.conv_layers:
-            x = layer(x, x_mask, t, c)
-        x = self.block(x, x_mask, cond, cond_mask, t)
+    def forward(self, x, c, t, x_mask):
+        x = self.resnet(x, x_mask, t, c)
+        x = self.conv1(x, c, x_mask)
+        x = self.conv2(x, c, x_mask)
+        x = self.conv3(x, c, x_mask)
+        x = self.block(x, x_mask, t)
         return x
 
 
@@ -277,7 +280,6 @@ class DiT(nn.Module):
                     kernel_size=kernel_size,
                     p_dropout=dropout,
                     utt_emb_dim=utt_emb_dim,
-                    conv_layers=2,
                     time_channels=hidden_channels,
                 )
             )
@@ -293,20 +295,12 @@ class DiT(nn.Module):
                     kernel_size=kernel_size,
                     p_dropout=dropout,
                     utt_emb_dim=utt_emb_dim,
-                    conv_layers=2,
                     time_channels=hidden_channels,
                 )
             )
 
         self.final_block = Block1D(hidden_channels, hidden_channels)
         self.final_proj = nn.Conv1d(hidden_channels, out_channels, 1)
-
-    #     self.initialize_weights()
-
-    # def initialize_weights(self):
-    #     for block in self.blocks:
-    #         nn.init.constant_(block.block.adaLN_modulation[-1].weight, 0)
-    #         nn.init.constant_(block.block.adaLN_modulation[-1].bias, 0)
 
     def forward(self, x, mask, mu, t, spks=None, cond=None, cond_mask=None):
         """Forward pass of the UNet1DConditional model.
@@ -330,13 +324,13 @@ class DiT(nn.Module):
 
         skip_connections = []
         for idx, block in enumerate(self.down_blocks):
-            x = block(x, spks, t, mask, cond, cond_mask)
+            x = block(x, spks, t, mask)
             skip_connections.append(x)
 
         for idx, block in enumerate(self.up_blocks):
             skip_x = skip_connections.pop()
             x = torch.cat([x, skip_x], dim=1)
-            x = block(x, spks, t, mask, cond, cond_mask)
+            x = block(x, spks, t, mask)
 
         x = self.final_block(x, mask)
         output = self.final_proj(x * mask)
