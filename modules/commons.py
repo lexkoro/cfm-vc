@@ -5,6 +5,14 @@ import torch
 from torch.nn import functional as F
 
 
+def update_adversarial_weight(iteration, warmup_steps=10000, adv_max_weight=1e-2):
+    """Update adversarial weight value based on iteration"""
+    weight_iter = iteration * warmup_steps**-1.5 * adv_max_weight / warmup_steps**-0.5
+    weight = min(adv_max_weight, weight_iter)
+
+    return weight
+
+
 def prob_mask_like(shape, prob, device):
     if prob == 1:
         return torch.ones(shape, device=device, dtype=torch.bool)

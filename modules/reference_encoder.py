@@ -1,10 +1,34 @@
 import torch
 import torch.nn as nn
 
-from modules.attentions import Encoder
-
-# from modules.mel_encoder import MelEncoder
+from modules.attentions import MultiHeadAttention
 from modules.perceiver_encoder import PerceiverResampler
+
+
+class AttentionPooling(nn.Module):
+    def __init__(self, hidden_channels):
+        super(AttentionPooling, self).__init__()
+        self.attention = nn.Sequential(
+            nn.Conv1d(hidden_channels, 128, kernel_size=1),
+            nn.Tanh(),
+            nn.Conv1d(128, hidden_channels, kernel_size=1),
+        )
+
+    def forward(self, x, mask):
+        attn_weights = self.attention(x)
+        attn_weights = attn_weights.masked_fill(mask == 0, -1e9)
+        attn_weights = torch.softmax(attn_weights, dim=2)
+        pooled = self.asp_encoder(x, attn_weights, mask)
+        return pooled
+
+    @staticmethod
+    def asp_encoder(x, w, mask):
+        len_ = mask.sum(dim=2)
+        mu = torch.sum((x * w) * mask, dim=2) / len_
+        sg = torch.sum(((x**2) * w) * mask, dim=2) / len_
+        sg = torch.sqrt((sg - (mu**2)).clamp(min=1e-5))
+        x = torch.cat((mu, sg), 1)
+        return x
 
 
 class Conv1dGLU(nn.Module):
@@ -71,27 +95,21 @@ class MelStyleEncoder(nn.Module):
             ff_mult=4,
         )
 
-        # attn
-        self.attn = Encoder(
-            hidden_channels=hidden_channels,
-            filter_channels=hidden_channels * 4,
-            n_layers=2,
+        # self attn
+        self.slf_attn = MultiHeadAttention(
+            hidden_channels,
+            hidden_channels,
             n_heads=n_heads,
             dim_head=dim_head,
-            kernel_size=3,
-            p_dropout=0.1,
-            use_cond_norm=False,
+            p_dropout=p_dropout,
         )
+        self.attn_drop = nn.Dropout(p_dropout)
 
-        self.fc_latents = nn.Conv1d(hidden_channels, cond_channels, kernel_size=1)
-        self.fc = nn.Conv1d(hidden_channels, utt_channels, kernel_size=1)
+        # attention pooling
+        self.attention_pooling = AttentionPooling(hidden_channels)
 
-    def temporal_avg_pool(self, x, mask=None):
-        # avg pooling
-        len_ = mask.sum(dim=2)
-        x = x.sum(dim=2)
-        out = torch.div(x, len_)
-        return out
+        # fc
+        self.fc = nn.Linear(hidden_channels * 2, utt_channels)
 
     def forward(self, x, x_mask=None):
         # spectral
@@ -102,13 +120,14 @@ class MelStyleEncoder(nn.Module):
         # resampler
         latents, latents_mask = self.resampler(x, x_mask)
         # attention
-        x = self.attn(x, x_mask)
+        attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
+        y = self.slf_attn(x, c=x, attn_mask=attn_mask)
+        x = self.attn_drop(y) + x
+
+        # attention pooling
+        x = self.attention_pooling(x, x_mask)
 
         # fc
-        utt_emb = self.fc(x) * x_mask
-        latents_emb = self.fc_latents(latents) * latents_mask
+        utt_emb = self.fc(x)
 
-        # temoral average pooling for utterance embedding
-        utt_emb = self.temporal_avg_pool(utt_emb, mask=x_mask)
-
-        return utt_emb, latents_emb, latents_mask
+        return utt_emb, latents, latents_mask

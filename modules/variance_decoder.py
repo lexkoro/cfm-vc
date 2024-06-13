@@ -41,7 +41,7 @@ class AuxDecoder(nn.Module):
             hidden_channels, hidden_channels, kernel_size=3, padding=1
         )
 
-        self.aux_decoder = attentions.Decoder(
+        self.aux_decoder = attentions.Encoder(
             hidden_channels=hidden_channels,
             filter_channels=hidden_channels * 4,
             n_heads=n_heads,

@@ -38,8 +38,8 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.num_mels = hparams.data.n_mel_channels
         self.mel_fmin = hparams.data.mel_fmin
         self.mel_fmax = hparams.data.mel_fmax
-        self.min_file_length = hparams.data.min_file_length * self.sampling_rate
-        self.max_file_length = hparams.data.max_file_length * self.sampling_rate
+        # self.min_file_length = hparams.data.min_file_length * self.sampling_rate
+        # self.max_file_length = hparams.data.max_file_length * self.sampling_rate
         self.num_frames = int(4 * self.sampling_rate // self.hop_length)
 
         random.seed(1234)
@@ -54,18 +54,21 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
     def _filter_long_files(self, audio_paths):
         filtered = []
 
-        for p, speaker in audio_paths:
-            if (
-                self.min_file_length
-                < (Path(p).stat().st_size // 2)
-                < self.max_file_length
-            ):
-                filtered.append([p, speaker])
+        # for p, speaker in audio_paths:
+        #     if (
+        #         self.min_file_length
+        #         < (Path(p).stat().st_size // 2)
+        #         < self.max_file_length
+        #     ):
+        #         filtered.append([p, speaker])
 
+        self.unique_speaker_count = len(set([x[1] for x in audio_paths]))
+
+        print("Unique speakers:", self.unique_speaker_count)
         print("Audiopaths before filtering:", len(audio_paths))
-        print("Audiopaths after filtering:", len(filtered))
+        # print("Audiopaths after filtering:", len(filtered))
 
-        return filtered
+        return audio_paths
 
     def get_audio(self, filename):
         # filename = filename.replace("\\", "/")
@@ -93,18 +96,23 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         )
         spec = torch.squeeze(spec, 0)
 
+        # energy
+        energy = audio_to_energy(
+            audio_norm,
+            self.filter_length,
+            self.num_mels,
+            self.sampling_rate,
+            self.hop_length,
+            self.win_length,
+            self.mel_fmin,
+            self.mel_fmax,
+        )
+
         # load f0 and uv
         f0_path = filename.replace(".wav", ".rmvpe.pt")
         loaded_data = torch.load(f0_path)
         f0 = loaded_data["f0"].unsqueeze(0)
         uv = loaded_data["uv"]
-
-        # load ppgs
-        ppg_path = filename.replace(".wav", ".ppg.pt")
-        ppg = torch.load(ppg_path)
-        ppg = utils.repeat_expand_2d(
-            ppg.squeeze(0), f0.shape[1], mode=self.unit_interpolate_mode
-        )
 
         # load hubert
         hubert_path = filename.replace(".wav", ".soft.pt")
@@ -124,31 +132,34 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             filename,
         )
         assert abs(audio_norm.shape[1] - lmin * self.hop_length) < 3 * self.hop_length
-        spec, c, f0, uv, ppg = (
+        spec, c, f0, uv, energy = (
             spec[:, :lmin],
             c[:, :lmin],
             f0[:, :lmin],
             uv[:lmin],
-            ppg[:, :lmin],
+            energy[:, :lmin],
         )
         audio_norm = audio_norm[:, : lmin * self.hop_length]
 
-        return c, f0, spec, audio_norm, uv, ppg
+        # speaker id
+        speaker_id = torch.LongTensor([int(speaker_id)])
 
-    def random_slice(self, c, f0, spec, audio_norm, uv, ppg):
+        return c, f0, spec, audio_norm, uv, energy, speaker_id
+
+    def random_slice(self, c, f0, spec, audio_norm, uv, energy, speaker_id):
         if spec.shape[1] > self.num_frames:
             start = random.randint(0, spec.shape[1] - self.num_frames)
             end = start + self.num_frames - 1
-            spec, c, f0, uv, ppg = (
+            spec, c, f0, uv, energy = (
                 spec[:, start:end],
                 c[:, start:end],
                 f0[:, start:end],
                 uv[start:end],
-                ppg[:, start:end],
+                energy[:, start:end],
             )
             audio_norm = audio_norm[:, start * self.hop_length : end * self.hop_length]
 
-        return c, f0, spec, audio_norm, uv, ppg
+        return c, f0, spec, audio_norm, uv, energy, speaker_id
 
     def __getitem__(self, index):
         if self.all_in_mem:
@@ -172,20 +183,21 @@ class TextAudioCollate:
         max_wav_len = max([x[3].size(1) for x in batch])
 
         lengths = torch.LongTensor(len(batch))
+        sid = torch.LongTensor(len(batch))
 
         c_padded = torch.FloatTensor(len(batch), batch[0][0].shape[0], max_c_len)
         f0_padded = torch.FloatTensor(len(batch), 1, max_c_len)
-        ppg_padded = torch.FloatTensor(len(batch), batch[0][5].shape[0], max_c_len)
         spec_padded = torch.FloatTensor(len(batch), batch[0][2].shape[0], max_c_len)
         wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
         uv_padded = torch.FloatTensor(len(batch), max_c_len)
+        energy_padded = torch.FloatTensor(len(batch), 1, max_c_len)
 
         c_padded.zero_()
         spec_padded.zero_()
         f0_padded.zero_()
-        ppg_padded.zero_()
         wav_padded.zero_()
         uv_padded.zero_()
+        energy_padded.zero_()
 
         for i in range(len(ids_sorted_decreasing)):
             row = batch[ids_sorted_decreasing[i]]
@@ -206,8 +218,10 @@ class TextAudioCollate:
             uv = row[4]
             uv_padded[i, : uv.size(0)] = uv
 
-            ppg = row[5]
-            ppg_padded[i, :, : ppg.size(1)] = ppg
+            energy = row[5]
+            energy_padded[i, 0, : energy.size(1)] = energy
+
+            sid[i] = row[6]
 
         return (
             c_padded,
@@ -216,7 +230,8 @@ class TextAudioCollate:
             wav_padded,
             lengths,
             uv_padded,
-            ppg_padded,
+            energy_padded,
+            sid,
         )
 
 

@@ -28,7 +28,7 @@
     "vol_aug": false
   },
   "data": {
-    "training_files": "/workspace/vc_train.csv",
+    "training_files": "/workspace/vc_train_cleaned.csv",
     "validation_files": "/workspace/vc_test.csv",
     "max_wav_value": 32768.0,
     "sampling_rate": 22050,
@@ -38,23 +38,19 @@
     "n_mel_channels": 128,
     "mel_fmin": 0,
     "mel_fmax": 8000,
-    "min_file_length": 0.3,
-    "max_file_length": 10.0,
     "unit_interpolate_mode": "nearest"
   },
   "model": {
-    "inter_channels": 192,
-    "hidden_channels": 192,
+    "inter_channels": 256,
+    "hidden_channels": 256,
     "filter_channels": 768,
-    "n_heads": 2,
+    "n_heads": 8,
+    "dim_head": 64,
     "n_layers": 6,
     "kernel_size": 3,
     "p_dropout": 0.1,
-    "speaker_embedding": 512,
+    "speaker_embedding": 384,
     "ssl_dim": 768,
-    "ppgs_dim": 40,
-    "n_speakers": 2587,
-    "speech_encoder": "vec768l12",
-    "vol_embedding": false
+    "speech_encoder": "vec768l12"
   }
 }

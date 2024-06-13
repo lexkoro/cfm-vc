@@ -158,6 +158,7 @@ class Encoder(nn.Module):
         p_dropout=0.0,
         utt_emb_dim=0,
         use_cond_norm=True,
+        causal_ffn=False,
     ):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -177,7 +178,7 @@ class Encoder(nn.Module):
 
         for i in range(self.n_layers):
             self.attn_layers.append(
-                MultiHeadAttention(
+                ConditionalMultiHeadAttention(
                     hidden_channels,
                     hidden_channels,
                     n_heads,
@@ -198,6 +199,7 @@ class Encoder(nn.Module):
                     filter_channels,
                     kernel_size=kernel_size,
                     p_dropout=p_dropout,
+                    causal=causal_ffn,
                 )
             )
             self.norm_layers_2.append(
@@ -206,23 +208,25 @@ class Encoder(nn.Module):
                 else LayerNorm(hidden_channels)
             )
 
-    def forward(self, x, x_mask, g=None):
+        self.final_norm = LayerNorm(hidden_channels)
+
+    def forward(self, x, x_mask, h, h_mask, g=None):
         # attn mask
-        attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
+        cond_mask = torch.cat([h_mask, x_mask], dim=-1)
+        attn_mask = cond_mask.unsqueeze(2) * cond_mask.unsqueeze(-1)
+
         x = x * x_mask
 
         for i in range(self.n_layers):
             # self-attention
-            y = self.attn_layers[i](x, x, attn_mask)
-            y = self.drop(y)
-            x = self.norm_layers_1[i](x + y, g)
+            self_in = self.norm_layers_1[i](x, g)
+            x = self.attn_layers[i](self_in, c=h, attn_mask=attn_mask) + x
 
             # feed-forward
-            y = self.ffn_layers_1[i](x, x_mask)
-            y = self.drop(y)
-            x = self.norm_layers_2[i](x + y, g)
+            ff_in = self.norm_layers_2[i](x, g)
+            x = self.ffn_layers_1[i](ff_in, x_mask) + x
 
-        x = x * x_mask
+        x = self.final_norm(x) * x_mask
         return x
 
 
@@ -344,6 +348,83 @@ class MultiHeadAttention(nn.Module):
         r = torch.arange(length, dtype=torch.float32)
         diff = torch.unsqueeze(r, 0) - torch.unsqueeze(r, 1)
         return torch.unsqueeze(torch.unsqueeze(-torch.log1p(torch.abs(diff)), 0), 0)
+
+
+class ConditionalMultiHeadAttention(nn.Module):
+    def __init__(
+        self,
+        channels,
+        out_channels,
+        n_heads,
+        dim_head=None,
+        p_dropout=0.0,
+    ):
+        super().__init__()
+        assert channels % n_heads == 0
+
+        self.channels = channels
+        if dim_head is not None:
+            self.dim_head = dim_head
+            self.channels = dim_head * n_heads
+        self.out_channels = out_channels
+        self.n_heads = n_heads
+        self.p_dropout = p_dropout
+
+        self.k_channels = self.channels // n_heads
+
+        self.conv_q = torch.nn.Conv1d(channels, self.channels, 1)
+        self.conv_k = torch.nn.Conv1d(channels, self.channels, 1)
+        self.conv_v = torch.nn.Conv1d(channels, self.channels, 1)
+
+        self.query_rotary_pe = RotaryEmbedding(self.k_channels)
+        self.key_rotary_pe = RotaryEmbedding(self.k_channels)
+
+        self.conv_o = torch.nn.Conv1d(self.channels, out_channels, 1)
+        self.drop = torch.nn.Dropout(p_dropout)
+
+        torch.nn.init.xavier_uniform_(self.conv_q.weight)
+        torch.nn.init.xavier_uniform_(self.conv_k.weight)
+        torch.nn.init.xavier_uniform_(self.conv_v.weight)
+
+    def forward(self, x, c, attn_mask=None):
+        # length of the sequence
+        t_t, t_s = x.size(2), c.size(2)
+
+        # rotary positional embedding
+        query_emb = self.query_rotary_pe(t_t)
+        key_emb = self.key_rotary_pe(t_s)
+        query_emb = key_emb = torch.cat((key_emb, query_emb), dim=0)
+        x = c = torch.cat((c, x), dim=-1)
+        t_t = x.size(2)
+
+        # conv
+        query = self.conv_q(x)
+        key = self.conv_k(c)
+        value = self.conv_v(c)
+
+        # split heads
+        b, d = key.size(0), key.size(1)
+        query = rearrange(query, "b (h c) t-> b h t c", h=self.n_heads)
+        key = rearrange(key, "b (h c) t-> b h t c", h=self.n_heads)
+        value = rearrange(value, "b (h c) t-> b h t c", h=self.n_heads)
+
+        # apply rotary positional embedding
+        query = apply_rotary_pos_emb(query_emb, query)
+        key = apply_rotary_pos_emb(key_emb, key)
+
+        # attention
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.k_channels)
+
+        if attn_mask is not None:
+            scores = scores.masked_fill(attn_mask == 0, -1e4)
+        p_attn = torch.nn.functional.softmax(scores, dim=-1)
+        p_attn = self.drop(p_attn)
+        output = torch.matmul(p_attn, value)
+        output = output.transpose(2, 3).contiguous().view(b, d, t_t)
+
+        x = self.conv_o(output)
+        x = x[:, :, t_s:]
+        return x
 
 
 class FFN(nn.Module):

@@ -136,6 +136,7 @@ def run(rank, n_gpus, hps):
 
     net_g = SynthesizerTrn(
         hps.data.n_mel_channels,
+        n_speakers=train_dataset.unique_speaker_count,
         **hps.model,
     ).cuda(rank)
 
@@ -231,28 +232,40 @@ def train_and_evaluate(
 
     net_g.train()
     for batch_idx, items in enumerate(train_loader):
-        c, f0, spec, y, lengths, uv, ppgs = items
+        c, f0, spec, y, lengths, uv, energy, sid = items
         spec = spec.cuda(rank, non_blocking=True)
         y = y.cuda(rank, non_blocking=True)
         c = c.cuda(rank, non_blocking=True)
         f0 = f0.cuda(rank, non_blocking=True)
         uv = uv.cuda(rank, non_blocking=True)
         lengths = lengths.cuda(rank, non_blocking=True)
-        ppgs = ppgs.cuda(rank, non_blocking=True)
+        energy = energy.cuda(rank, non_blocking=True)
+        sid = sid.cuda(rank, non_blocking=True)
 
         with autocast(enabled=hps.train.fp16_run, dtype=half_type):
-            (prior_loss, diff_loss, f0_pred, lf0) = net_g(
+            (prior_loss, diff_loss, f0_pred, lf0, energy_pred, speaker_logits) = net_g(
                 c,
                 f0,
                 uv,
+                energy,
                 spec,
-                ppgs=ppgs,
                 c_lengths=lengths,
             )
 
         with autocast(enabled=False, dtype=half_type):
-            f0_loss = F.smooth_l1_loss(f0_pred, lf0.detach())  # f0 loss
-            loss_gen_all = diff_loss + prior_loss + f0_loss
+            # speaker reversak loss
+            speaker_weight = commons.update_adversarial_weight(
+                iteration=global_step + 1, warmup_steps=1
+            )
+            speaker_loss = F.cross_entropy(speaker_logits, sid) * speaker_weight
+
+            # energy loss
+            energy_loss = F.smooth_l1_loss(energy_pred, energy.detach())
+
+            # pitch loss
+            f0_loss = F.smooth_l1_loss(f0_pred, lf0.detach())
+
+            loss_gen_all = diff_loss + prior_loss + f0_loss + energy_loss + speaker_loss
 
         optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
@@ -265,7 +278,7 @@ def train_and_evaluate(
         if rank == 0:
             if global_step % hps.train.log_interval == 0:
                 lr = optim_g.param_groups[0]["lr"]
-                losses = [diff_loss, prior_loss, f0_loss]
+                losses = [diff_loss, prior_loss, f0_loss, speaker_loss]
                 reference_loss = 0
                 for i in losses:
                     reference_loss += i
@@ -286,10 +299,10 @@ def train_and_evaluate(
                 scalar_dict.update(
                     {
                         "loss/g/diff": diff_loss,
-                        # "loss/g/reversal": reversal_loss,
                         "loss/g/prior": prior_loss,
                         "loss/g/f0": f0_loss,
-                        # "loss/g/energy": energy_loss,
+                        "loss/g/energy": energy_loss,
+                        "loss/g/speaker": speaker_loss,
                     }
                 )
 
@@ -301,10 +314,10 @@ def train_and_evaluate(
                         lf0[0, 0, :].cpu().numpy(),
                         f0_pred[0, 0, :].detach().cpu().numpy(),
                     ),
-                    # "all/energy": utils.plot_data_to_numpy(
-                    #     energy[0, 0, :].cpu().numpy(),
-                    #     energy_pred[0, 0, :].detach().cpu().numpy(),
-                    # ),
+                    "all/energy": utils.plot_data_to_numpy(
+                        energy[0, 0, :].cpu().numpy(),
+                        energy_pred[0, 0, :].detach().cpu().numpy(),
+                    ),
                 }
 
                 utils.summarize(
@@ -354,16 +367,14 @@ def evaluate(hps, generator, eval_loader, writer_eval):
     audio_dict = {}
     with torch.no_grad():
         for batch_idx, items in enumerate(eval_loader):
-            c, f0, spec, y, lengths, uv, ppgs = items
+            c, f0, spec, y, lengths, uv, energy, _ = items
             spec, y = spec[:1].cuda(0), y[:1].cuda(0)
             c = c[:1].cuda(0)
             f0 = f0[:1].cuda(0)
             uv = uv[:1].cuda(0)
-            ppgs = ppgs[:1].cuda(0)
+            energy = energy[:1].cuda(0)
 
-            y_dec, _ = generator.module.infer(
-                c, spec, f0, uv, ppgs=ppgs, n_timesteps=10
-            )
+            y_dec, _ = generator.module.infer(c, spec, f0, uv, energy, n_timesteps=10)
 
         image_dict.update(
             {

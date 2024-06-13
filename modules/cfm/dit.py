@@ -145,8 +145,6 @@ class Encoder(nn.Module):
                 )
             )
 
-        self.norm = LayerNorm(hidden_channels)
-
     def forward(self, x, x_mask, t):
         # attn mask
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
@@ -161,7 +159,7 @@ class Encoder(nn.Module):
             ffn_input = self.norm_layers_1[i](x, t)
             x = self.ffn_layers_1[i](ffn_input, x_mask) + x
 
-        return self.norm(x * x_mask)
+        return x * x_mask
 
 
 class DitWrapper(nn.Module):
@@ -171,6 +169,7 @@ class DitWrapper(nn.Module):
         hidden_channels,
         filter_channels,
         num_heads,
+        dim_head,
         kernel_size=3,
         p_dropout=0.1,
         utt_emb_dim=0,
@@ -198,6 +197,7 @@ class DitWrapper(nn.Module):
             filter_channels=filter_channels,
             time_channels=time_channels,
             n_heads=num_heads,
+            dim_head=dim_head,
             n_layers=1,
             kernel_size=kernel_size,
             p_dropout=p_dropout,
@@ -254,6 +254,7 @@ class DiT(nn.Module):
         dropout=0.05,
         n_layers=1,
         n_heads=4,
+        dim_head=64,
         kernel_size=3,
         utt_emb_dim=0,
     ):
@@ -277,6 +278,7 @@ class DiT(nn.Module):
                     hidden_channels=hidden_channels,
                     filter_channels=filter_channels,
                     num_heads=n_heads,
+                    dim_head=dim_head,
                     kernel_size=kernel_size,
                     p_dropout=dropout,
                     utt_emb_dim=utt_emb_dim,
@@ -292,6 +294,7 @@ class DiT(nn.Module):
                     hidden_channels=hidden_channels,
                     filter_channels=filter_channels,
                     num_heads=n_heads,
+                    dim_head=dim_head,
                     kernel_size=kernel_size,
                     p_dropout=dropout,
                     utt_emb_dim=utt_emb_dim,
@@ -302,7 +305,7 @@ class DiT(nn.Module):
         self.final_block = Block1D(hidden_channels, hidden_channels)
         self.final_proj = nn.Conv1d(hidden_channels, out_channels, 1)
 
-    def forward(self, x, mask, mu, t, spks=None, cond=None, cond_mask=None):
+    def forward(self, x, mask, mu, t, spks=None):
         """Forward pass of the UNet1DConditional model.
 
         Args:

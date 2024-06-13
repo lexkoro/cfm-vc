@@ -13,11 +13,11 @@ class ContentEncoder(nn.Module):
         hidden_channels,
         n_feats,
         ssl_dim,
-        ppgs_dim,
         kernel_size,
         n_layers,
         filter_channels=None,
         n_heads=None,
+        dim_head=None,
         p_dropout=0.0,
         utt_emb_dim=0,
     ):
@@ -27,6 +27,10 @@ class ContentEncoder(nn.Module):
         self.n_layers = n_layers
         self.uv_emb = nn.Embedding(2, hidden_channels)
         self.f0_emb = ConditionalEmbedding(256, hidden_channels, style_dim=utt_emb_dim)
+        self.energy_emb = nn.Sequential(
+            nn.Conv1d(1, hidden_channels, kernel_size=9, padding=(9 - 1) // 2),
+            nn.Dropout(0.5),
+        )
 
         # ContentVec prenet
         self.ssl_prenet = ResBlk1d(
@@ -45,19 +49,21 @@ class ContentEncoder(nn.Module):
             kernel_size=kernel_size,
             n_layers=n_layers,
             n_heads=n_heads,
-            p_dropout=0.1,
+            dim_head=dim_head,
+            p_dropout=p_dropout,
             utt_emb_dim=utt_emb_dim,
         )
 
-        # ppg decoder
-        self.ppg_decoder = AuxDecoder(
-            input_channels=ppgs_dim,
+        # energy decoder
+        self.energy_decoder = AuxDecoder(
+            input_channels=1,
             hidden_channels=hidden_channels,
-            output_channels=hidden_channels,
+            output_channels=1,
             kernel_size=kernel_size,
-            n_layers=n_layers,
+            n_layers=4,
             n_heads=n_heads,
-            p_dropout=0.1,
+            dim_head=dim_head,
+            p_dropout=p_dropout,
             utt_emb_dim=utt_emb_dim,
         )
 
@@ -66,6 +72,7 @@ class ContentEncoder(nn.Module):
             hidden_channels=hidden_channels,
             filter_channels=filter_channels,
             n_heads=n_heads,
+            dim_head=dim_head,
             n_layers=n_layers,
             kernel_size=kernel_size,
             p_dropout=p_dropout,
@@ -89,17 +96,16 @@ class ContentEncoder(nn.Module):
         cond_mask=None,
         f0=None,
         uv=None,
-        ppgs=None,
+        energy=None,
         utt_emb=None,
     ):
         # prenet
         x = self.ssl_prenet(x) * x_mask
 
+        x_speaker_classifier = x
+
         # add uv to x
         x = x + self.uv_emb(uv.long()).transpose(1, 2)
-
-        # ppg decoder
-        ppg_pred = self.ppg_decoder(x, x_mask, ppgs, cond, cond_mask, utt_emb)
 
         # pitch
         lf0 = 2595.0 * torch.log10(1.0 + f0 / 700.0) / 500
@@ -108,16 +114,20 @@ class ContentEncoder(nn.Module):
         f0 = f0_to_coarse(f0.squeeze(1))
         f0_emb = self.f0_emb(f0, x_mask, utt_emb)
 
-        # add f0 and ppg to x
-        x = x + f0_emb + ppg_pred
+        # energy
+        energy_pred = self.energy_decoder(x, x_mask, energy, cond, cond_mask, utt_emb)
+        energy_emb = self.energy_emb(energy)
+
+        # add f0 to x
+        x = x + f0_emb + energy_emb
 
         # encode prosodic features
-        x = self.encoder(x, x_mask, utt_emb)
+        x = self.encoder(x, x_mask, cond, cond_mask, utt_emb)
 
         # # project to mu
         mu = self.proj_m(x) * x_mask
 
-        return mu, x_mask, f0_pred, lf0
+        return x_speaker_classifier, mu, x_mask, f0_pred, lf0, energy_pred
 
     def vc(
         self,
@@ -127,7 +137,7 @@ class ContentEncoder(nn.Module):
         cond_mask,
         f0=None,
         uv=None,
-        ppgs=None,
+        energy=None,
         utt_emb=None,
     ):
         # prenet
@@ -135,9 +145,6 @@ class ContentEncoder(nn.Module):
 
         # add uv to x
         x = x + self.uv_emb(uv.long()).transpose(1, 2)
-
-        # ppg decoder
-        ppg_pred = self.ppg_decoder(x, x_mask, ppgs, cond, cond_mask, utt_emb)
 
         # pitch
         lf0 = 2595.0 * torch.log10(1.0 + f0 / 700.0) / 500
@@ -147,11 +154,15 @@ class ContentEncoder(nn.Module):
         f0 = f0_to_coarse(f0)
         f0_emb = self.f0_emb(f0, x_mask, utt_emb)
 
-        # add f0 and ppg to x
-        x = x + f0_emb + ppg_pred
+        # energy
+        energy_pred = self.energy_decoder(x, x_mask, energy, cond, cond_mask, utt_emb)
+        energy_emb = self.energy_emb(energy_pred)
+
+        # add f0 to x
+        x = x + f0_emb + energy_emb
 
         # encode prosodic features
-        x = self.encoder(x, x_mask, utt_emb)
+        x = self.encoder(x, x_mask, cond, cond_mask, utt_emb)
 
         # # project to mu
         mu = self.proj_m(x) * x_mask

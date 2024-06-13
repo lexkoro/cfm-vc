@@ -9,7 +9,6 @@ from pathlib import Path
 
 import librosa
 import numpy as np
-import ppgs
 
 # import onnxruntime
 import soundfile
@@ -18,6 +17,7 @@ import torchaudio
 
 import utils
 from models import SynthesizerTrn
+from utils import audio_to_energy
 
 # from models_cf import SynthesizerTrn
 
@@ -166,6 +166,7 @@ class Svc(object):
         # get model configuration
         self.net_g_ms = SynthesizerTrn(
             self.hps_ms.data.n_mel_channels,
+            n_speakers=3743,
             **self.hps_ms.model,
         )
         _ = utils.load_checkpoint(self.net_g_path, self.net_g_ms, None)
@@ -260,7 +261,25 @@ class Svc(object):
             )
 
         # resample to target sample rate
-        wav = self.audio_resample_transform(wav).squeeze(0).numpy()
+        wav = self.audio_resample_transform(wav).squeeze(0)
+
+        # energy
+        energy = (
+            audio_to_energy(
+                wav.unsqueeze(0),
+                self.hps_ms.data.filter_length,
+                self.hps_ms.data.n_mel_channels,
+                self.hps_ms.data.sampling_rate,
+                self.hps_ms.data.hop_length,
+                self.hps_ms.data.win_length,
+                self.hps_ms.data.mel_fmin,
+                self.hps_ms.data.mel_fmax,
+            )
+            .unsqueeze(0)
+            .to(self.dev)
+        )
+
+        wav = wav.numpy()
 
         # get the root path of the file
         c_targets = []
@@ -300,7 +319,7 @@ class Svc(object):
             mels, mel_lengths
         )
 
-        # get contentvec, f0, uv and ppg
+        # get contentvec, f0, uv and energy
         c, f0, uv = self.get_unit_f0(
             wav,
             c_targets,
@@ -311,17 +330,9 @@ class Svc(object):
             cr_threshold=cr_threshold,
         )
 
-        # Infer PPGs
-        audio = ppgs.load.audio(raw_path)
-        ppg = ppgs.from_audio(audio, ppgs.SAMPLE_RATE, gpu=0).to(self.dev)
-        ppg = utils.repeat_expand_2d(
-            ppg.squeeze(0), f0.shape[-1], self.unit_interpolate_mode
-        ).unsqueeze(0)
-
         c = c.to(self.dtype)
         f0 = f0.to(self.dtype)
         uv = uv.to(self.dtype)
-        ppg = ppg.to(self.dtype)
 
         with torch.no_grad():
             o, _ = self.net_g_ms.vc(
@@ -330,7 +341,7 @@ class Svc(object):
                 cond_mask=cond_mask,
                 f0=f0,
                 uv=uv,
-                ppgs=ppg,
+                energy=energy,
                 g=speaker_embedding,
                 n_timesteps=n_timesteps,
                 temperature=temperature,
@@ -377,67 +388,3 @@ class Svc(object):
         )
 
         return out_audio
-
-
-class RealTimeVC:
-    def __init__(self):
-        self.last_chunk = None
-        self.last_o = None
-        self.chunk_len = 16000  # chunk length
-        self.pre_len = 3840  # cross fade length, multiples of 640
-
-    # Input and output are 1-dimensional numpy waveform arrays
-
-    def process(
-        self,
-        svc_model,
-        speaker_id,
-        f_pitch_change,
-        input_wav_path,
-        cluster_infer_ratio=0,
-        auto_predict_f0=False,
-        noice_scale=0.4,
-        f0_filter=False,
-    ):
-        import maad
-
-        audio, sr = torchaudio.load(input_wav_path)
-        audio = audio.cpu().numpy()[0]
-        temp_wav = io.BytesIO()
-        if self.last_chunk is None:
-            input_wav_path.seek(0)
-
-            audio, sr = svc_model.infer(
-                speaker_id,
-                f_pitch_change,
-                input_wav_path,
-                cluster_infer_ratio=cluster_infer_ratio,
-                auto_predict_f0=auto_predict_f0,
-                noice_scale=noice_scale,
-                f0_filter=f0_filter,
-            )
-
-            audio = audio.cpu().numpy()
-            self.last_chunk = audio[-self.pre_len :]
-            self.last_o = audio
-            return audio[-self.chunk_len :]
-        else:
-            audio = np.concatenate([self.last_chunk, audio])
-            soundfile.write(temp_wav, audio, sr, format="wav")
-            temp_wav.seek(0)
-
-            audio, sr = svc_model.infer(
-                speaker_id,
-                f_pitch_change,
-                temp_wav,
-                cluster_infer_ratio=cluster_infer_ratio,
-                auto_predict_f0=auto_predict_f0,
-                noice_scale=noice_scale,
-                f0_filter=f0_filter,
-            )
-
-            audio = audio.cpu().numpy()
-            ret = maad.util.crossfade(self.last_o, audio, self.pre_len)
-            self.last_chunk = audio[-self.pre_len :]
-            self.last_o = audio
-            return ret[self.chunk_len : 2 * self.chunk_len]
