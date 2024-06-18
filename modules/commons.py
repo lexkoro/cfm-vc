@@ -1,8 +1,104 @@
 import math
+import random
+from itertools import groupby
 
 import numpy as np
 import torch
+from einops import repeat
 from torch.nn import functional as F
+
+
+def rand_mel_segment(mel, mel_lengths, min_out_size):
+    feats = mel.size(1)
+    max_mel_length = max(mel_lengths)
+    out_size = max(min_out_size, max_mel_length // 2)
+    out_size = int(
+        min(out_size, max_mel_length)
+    )  # if max length < out_size, then decrease out_size
+
+    # adjust out size by finding the largest multiple of 4 which is smaller than it
+    max_offset = (mel_lengths - out_size).clamp(0)
+    offset_ranges = list(
+        zip([0] * max_offset.shape[0], max_offset.cpu().numpy().astype(int))
+    )
+    out_offset = torch.LongTensor(
+        [
+            torch.tensor(random.choice(range(start, end)) if end > start else 0)
+            for start, end in offset_ranges
+        ]
+    ).to(mel_lengths)
+
+    y_cut = torch.zeros(
+        mel.shape[0], feats, out_size, dtype=mel.dtype, device=mel.device
+    )
+    y_cut_lengths = []
+    for i, (y_, out_offset_) in enumerate(zip(mel, out_offset)):
+        y_cut_length = out_size + (mel_lengths[i] - out_size).clamp(None, 0)
+        y_cut_lengths.append(y_cut_length)
+        cut_lower, cut_upper = out_offset_, out_offset_ + y_cut_length
+        y_cut[i, :, :y_cut_length] = y_[:, cut_lower:cut_upper]
+
+    y_cut_lengths = torch.LongTensor(y_cut_lengths).to(mel_lengths.device)
+
+    return y_cut, y_cut_lengths
+
+
+def collate_1d_or_2d(
+    values, pad_idx=0, left_pad=False, shift_right=False, max_len=None, shift_id=1
+):
+    if len(values[0].shape) == 1:
+        return collate_1d(values, pad_idx, left_pad, shift_right, max_len, shift_id)
+    else:
+        return collate_2d(values, pad_idx, left_pad, shift_right, max_len)
+
+
+def collate_1d(
+    values, pad_idx=0, left_pad=False, shift_right=False, max_len=None, shift_id=1
+):
+    """Convert a list of 1d tensors into a padded 2d tensor."""
+    size = max(v.size(0) for v in values) if max_len is None else max_len
+    res = values[0].new(len(values), size).fill_(pad_idx)
+
+    def copy_tensor(src, dst):
+        assert dst.numel() == src.numel()
+        if shift_right:
+            dst[1:] = src[:-1]
+            dst[0] = shift_id
+        else:
+            dst.copy_(src)
+
+    for i, v in enumerate(values):
+        copy_tensor(v, res[i][size - len(v) :] if left_pad else res[i][: len(v)])
+    return res
+
+
+def collate_2d(values, pad_idx=0, left_pad=False, shift_right=False, max_len=None):
+    """Convert a list of 2d tensors into a padded 3d tensor."""
+    size = max(v.size(0) for v in values) if max_len is None else max_len
+    res = values[0].new(len(values), size, values[0].shape[1]).fill_(pad_idx)
+
+    def copy_tensor(src, dst):
+        assert dst.numel() == src.numel()
+        if shift_right:
+            dst[1:] = src[:-1]
+        else:
+            dst.copy_(src)
+
+    for i, v in enumerate(values):
+        copy_tensor(v, res[i][size - len(v) :] if left_pad else res[i][: len(v)])
+    return res
+
+
+def dedup_seq(seq):
+    B, L = seq.shape
+    vals, counts = [], []
+    for i in range(B):
+        val, count = zip(*[(k.item(), sum(1 for _ in g)) for k, g in groupby(seq[i])])
+        vals.append(torch.LongTensor(val))
+        counts.append(torch.LongTensor(count))
+    vals = collate_1d_or_2d(vals, 0)
+    counts = collate_1d_or_2d(counts, 0)
+    return vals, counts
 
 
 def update_adversarial_weight(iteration, warmup_steps=10000, adv_max_weight=1e-2):
@@ -278,3 +374,111 @@ def maximum_path_numpy(value, mask, max_neg_val=None):
     path = path * mask.astype(np.float32)
     path = torch.from_numpy(path).to(device=device, dtype=dtype)
     return path
+
+
+# def average_over_durations(values, durs):
+#     """
+#     - in:
+#         - values: B, 1, T_de
+#         - durs: B, T_en
+#     - out:
+#         - avg: B, 1, T_en
+#     """
+#     durs_cums_ends = torch.cumsum(durs, dim=1).long()
+#     durs_cums_starts = torch.nn.functional.pad(durs_cums_ends[:, :-1], (1, 0))
+#     values_nonzero_cums = torch.nn.functional.pad(
+#         torch.cumsum(values != 0.0, dim=2), (1, 0)
+#     )
+#     values_cums = torch.nn.functional.pad(torch.cumsum(values, dim=2), (1, 0))
+
+#     bs, l = durs_cums_ends.size()
+#     n_formants = values.size(1)
+#     dcs = repeat(durs_cums_starts, "bs l -> bs n l", n=n_formants)
+#     dce = repeat(durs_cums_ends, "bs l -> bs n l", n=n_formants)
+
+#     values_sums = (
+#         torch.gather(values_cums, 2, dce) - torch.gather(values_cums, 2, dcs)
+#     ).to(values.dtype)
+#     values_nelems = (
+#         torch.gather(values_nonzero_cums, 2, dce)
+#         - torch.gather(values_nonzero_cums, 2, dcs)
+#     ).to(values.dtype)
+
+#     avg = torch.where(
+#         values_nelems == 0.0, values_nelems, values_sums / values_nelems
+#     ).to(values.dtype)
+#     return avg
+
+
+def average_over_durations(values: torch.Tensor, durs: torch.Tensor) -> torch.Tensor:
+    """
+    - in:
+        - values: B, C, T_de (B: batch size, C: number of channels, T_de: decoder timesteps)
+        - durs: B, T_en (B: batch size, T_en: encoder timesteps)
+    - out:
+        - avg: B, C, T_en (B: batch size, C: number of channels, T_en: encoder timesteps)
+    """
+    # Compute cumulative sums of durations to get start and end indices
+    durs_cums_ends = torch.cumsum(durs, dim=1).long()
+    durs_cums_starts = torch.nn.functional.pad(durs_cums_ends[:, :-1], (1, 0))
+
+    # Compute cumulative sums of values and non-zero values
+    values_nonzero_cums = torch.nn.functional.pad(
+        torch.cumsum(values != 0.0, dim=2), (1, 0)
+    )
+    values_cums = torch.nn.functional.pad(torch.cumsum(values, dim=2), (1, 0))
+
+    n_channels = values.size(1)
+    dcs = repeat(durs_cums_starts, "bs l -> bs n l", n=n_channels)
+    dce = repeat(durs_cums_ends, "bs l -> bs n l", n=n_channels)
+
+    # Compute sums and counts of elements within the durations
+    values_sums = (
+        torch.gather(values_cums, 2, dce) - torch.gather(values_cums, 2, dcs)
+    ).to(values.dtype)
+    values_nelems = (
+        torch.gather(values_nonzero_cums, 2, dce)
+        - torch.gather(values_nonzero_cums, 2, dcs)
+    ).to(values.dtype)
+
+    # Prevent division by zero
+    values_nelems = torch.where(
+        values_nelems == 0, torch.ones_like(values_nelems), values_nelems
+    )
+
+    # Compute the average values
+    avg = values_sums / values_nelems
+
+    return avg
+
+
+def mel2unit(features, durations):
+    """
+    Reverts the process of expanding a token sequence to a mel spectrogram.
+
+    Args:
+    mel_spectrogram (torch.Tensor): The input mel spectrogram tensor of shape (batch, n_mel_bins, frame_length).
+    durations (torch.Tensor): The tensor of durations of shape (batch, num_tokens).
+
+    Returns:
+    torch.Tensor: The aggregated token-level tensor of shape (batch, n_mel_bins, num_tokens).
+    """
+    batch_size, n_mel_bins, frame_length = features.shape
+    _, num_tokens = durations.shape
+
+    # Initialize the output tensor
+    token_level_spectrogram = torch.zeros(
+        (batch_size, n_mel_bins, num_tokens), device=features.device
+    )
+
+    for b in range(batch_size):
+        current_frame = 0
+        for t in range(num_tokens):
+            duration = durations[b, t].item()
+            if duration > 0:
+                # Aggregate the frames for the current token
+                token_frames = features[b, :, current_frame : current_frame + duration]
+                token_level_spectrogram[b, :, t] = token_frames.mean(dim=1)
+                current_frame += duration
+
+    return token_level_spectrogram

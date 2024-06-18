@@ -18,19 +18,11 @@ class ConditioningEncoder(nn.Module):
         dim_head=None,
         kernel_size=1,
         p_dropout=0.1,
-        cond_emb_dim=None,
     ):
         super().__init__()
         self.hidden_channels = hidden_channels
         self.n_heads = n_heads
         self.kernel_size = kernel_size
-
-        if hidden_channels != cond_emb_dim:
-            self.cond_conv = nn.Conv1d(
-                cond_emb_dim, hidden_channels, kernel_size=kernel_size
-            )
-        else:
-            self.cond_conv = nn.Identity()
 
         self.attn = MultiHeadAttention(
             hidden_channels,
@@ -42,8 +34,6 @@ class ConditioningEncoder(nn.Module):
         self.film = FiLM(hidden_channels, hidden_channels)
 
     def forward(self, x, x_mask, cond_latent=None, cond_mask=None):
-        cond_latent = self.cond_conv(cond_latent)
-
         # attn mask
         attn_mask = cond_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
 
@@ -98,12 +88,12 @@ class Decoder(nn.Module):
                 ConditionalLayerNorm(hidden_channels, utt_emb_dim)
             )
             self.encdec_attn_layers.append(
-                ConditioningEncoder(
+                MultiHeadAttention(
+                    hidden_channels,
                     hidden_channels,
                     n_heads,
                     dim_head=dim_head,
                     p_dropout=p_dropout,
-                    cond_emb_dim=hidden_channels,
                 )
             )
             self.norm_layers_1.append(
@@ -123,26 +113,31 @@ class Decoder(nn.Module):
                 ConditionalLayerNorm(hidden_channels, utt_emb_dim)
             )
 
+        self.final_norm = LayerNorm(hidden_channels)
+
     def forward(self, x, x_mask, h, h_mask, g=None):
         """
         x: decoder input
         h: encoder output
         """
         self_attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
+        cross_attn_mask = h_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
         for i in range(self.n_layers):
-            y = self.self_attn_layers[i](x, x, self_attn_mask)
-            y = self.drop(y)
-            x = self.norm_layers_0[i](x + y, g)
+            x_in = self.norm_layers_0[i](x, g)
+            x = self.self_attn_layers[i](x_in, c=x_in, attn_mask=self_attn_mask) + x
 
-            y = self.encdec_attn_layers[i](x, x_mask, h, h_mask)
-            y = self.drop(y)
-            x = self.norm_layers_1[i](x + y, g)
+            x = (
+                self.encdec_attn_layers[i](
+                    self.norm_layers_1[i](x, g), c=h, attn_mask=cross_attn_mask
+                )
+                + x
+            )
 
-            y = self.ffn_layers[i](x, x_mask)
-            y = self.drop(y)
-            x = self.norm_layers_2[i](x + y, g)
-        x = x * x_mask
+            x = self.ffn_layers[i](self.norm_layers_2[i](x, g), x_mask) + x
+
+        x = self.final_norm(x) * x_mask
+
         return x
 
 
@@ -268,6 +263,7 @@ class MultiHeadAttention(nn.Module):
         p_dropout=0.0,
         proximal_bias=False,
         proximal_init=False,
+        cross_attn_include_queries=False,
     ):
         super().__init__()
         assert channels % n_heads == 0
@@ -280,54 +276,55 @@ class MultiHeadAttention(nn.Module):
         self.n_heads = n_heads
         self.proximal_bias = proximal_bias
         self.p_dropout = p_dropout
-        self.attn = None
+        self.cross_attn_include_queries = cross_attn_include_queries
 
         self.k_channels = self.channels // n_heads
 
-        self.conv_q = nn.Conv1d(channels, self.channels, 1)
-        self.conv_k = nn.Conv1d(channels, self.channels, 1)
-        self.conv_v = nn.Conv1d(channels, self.channels, 1)
+        self.conv_q = torch.nn.Conv1d(channels, self.channels, 1)
+        self.conv_k = torch.nn.Conv1d(channels, self.channels, 1)
+        self.conv_v = torch.nn.Conv1d(channels, self.channels, 1)
 
         self.query_rotary_pe = RotaryEmbedding(self.k_channels)
         self.key_rotary_pe = RotaryEmbedding(self.k_channels)
 
-        self.conv_o = nn.Conv1d(self.channels, out_channels, 1)
-        self.drop = nn.Dropout(p_dropout)
+        self.conv_o = torch.nn.Conv1d(self.channels, out_channels, 1)
+        self.drop = torch.nn.Dropout(p_dropout)
 
-        nn.init.xavier_uniform_(self.conv_q.weight)
-        nn.init.xavier_uniform_(self.conv_k.weight)
+        torch.nn.init.xavier_uniform_(self.conv_q.weight)
+        torch.nn.init.xavier_uniform_(self.conv_k.weight)
         if proximal_init:
             self.conv_k.weight.data.copy_(self.conv_q.weight.data)
             self.conv_k.bias.data.copy_(self.conv_q.bias.data)
-        nn.init.xavier_uniform_(self.conv_v.weight)
+        torch.nn.init.xavier_uniform_(self.conv_v.weight)
 
     def forward(self, x, c, attn_mask=None):
-        q = self.conv_q(x)
-        k = self.conv_k(c)
-        v = self.conv_v(c)
+        # length of the sequence
+        t_t, t_s = x.size(2), c.size(2)
 
-        x, self.attn = self.attention(
-            q,
-            k,
-            v,
-            mask=attn_mask,
-        )
+        # rotary positional embedding
+        query_emb = self.query_rotary_pe(t_t)
+        key_emb = self.key_rotary_pe(t_s)
 
-        x = self.conv_o(x)
-        return x
+        if self.cross_attn_include_queries:
+            key_emb = torch.cat((query_emb, key_emb), dim=0)
+            c = torch.cat((x, c), dim=-1)
 
-    def attention(self, query, key, value, mask=None):
-        b, d, t_s, t_t = (*key.size(), query.size(2))
+        # conv
+        query = self.conv_q(x)
+        key = self.conv_k(c)
+        value = self.conv_v(c)
+
+        # split heads
+        b, d = key.size(0), key.size(1)
         query = rearrange(query, "b (h c) t-> b h t c", h=self.n_heads)
         key = rearrange(key, "b (h c) t-> b h t c", h=self.n_heads)
         value = rearrange(value, "b (h c) t-> b h t c", h=self.n_heads)
 
-        query_emb = self.query_rotary_pe(t_t)
+        # apply rotary positional embedding
         query = apply_rotary_pos_emb(query_emb, query)
-
-        key_emb = self.key_rotary_pe(t_s)
         key = apply_rotary_pos_emb(key_emb, key)
 
+        # attention
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.k_channels)
 
         if self.proximal_bias:
@@ -335,13 +332,15 @@ class MultiHeadAttention(nn.Module):
             scores = scores + self._attention_bias_proximal(t_s).to(
                 device=scores.device, dtype=scores.dtype
             )
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e4)
+        if attn_mask is not None:
+            scores = scores.masked_fill(attn_mask == 0, -1e4)
         p_attn = torch.nn.functional.softmax(scores, dim=-1)
         p_attn = self.drop(p_attn)
         output = torch.matmul(p_attn, value)
         output = output.transpose(2, 3).contiguous().view(b, d, t_t)
-        return output, p_attn
+
+        x = self.conv_o(output)
+        return x
 
     @staticmethod
     def _attention_bias_proximal(length):

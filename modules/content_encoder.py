@@ -11,7 +11,6 @@ class ContentEncoder(nn.Module):
     def __init__(
         self,
         hidden_channels,
-        n_feats,
         ssl_dim,
         kernel_size,
         n_layers,
@@ -60,7 +59,7 @@ class ContentEncoder(nn.Module):
             hidden_channels=hidden_channels,
             output_channels=1,
             kernel_size=kernel_size,
-            n_layers=4,
+            n_layers=n_layers // 2,
             n_heads=n_heads,
             dim_head=dim_head,
             p_dropout=p_dropout,
@@ -77,15 +76,6 @@ class ContentEncoder(nn.Module):
             kernel_size=kernel_size,
             p_dropout=p_dropout,
             utt_emb_dim=utt_emb_dim,
-        )
-
-        # project to mu
-        self.proj_m = ResBlk1d(
-            dim_in=hidden_channels,
-            intermediate_dim=hidden_channels,
-            dim_out=n_feats,
-            kernel_size=3,
-            normalize=True,
         )
 
     def forward(
@@ -124,10 +114,7 @@ class ContentEncoder(nn.Module):
         # encode prosodic features
         x = self.encoder(x, x_mask, cond, cond_mask, utt_emb)
 
-        # # project to mu
-        mu = self.proj_m(x) * x_mask
-
-        return x_speaker_classifier, mu, x_mask, f0_pred, lf0, energy_pred
+        return x_speaker_classifier, x, f0_pred, lf0, energy_pred
 
     def vc(
         self,
@@ -164,7 +151,4 @@ class ContentEncoder(nn.Module):
         # encode prosodic features
         x = self.encoder(x, x_mask, cond, cond_mask, utt_emb)
 
-        # # project to mu
-        mu = self.proj_m(x) * x_mask
-
-        return mu, x_mask
+        return x

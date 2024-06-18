@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+import modules.commons as commons
 from modules.attentions import MultiHeadAttention
 from modules.perceiver_encoder import PerceiverResampler
 
@@ -16,7 +17,7 @@ class AttentionPooling(nn.Module):
 
     def forward(self, x, mask):
         attn_weights = self.attention(x)
-        attn_weights = attn_weights.masked_fill(mask == 0, -1e9)
+        attn_weights = attn_weights.masked_fill(mask == 0, -1e4)
         attn_weights = torch.softmax(attn_weights, dim=2)
         pooled = self.asp_encoder(x, attn_weights, mask)
         return pooled
@@ -62,7 +63,6 @@ class MelStyleEncoder(nn.Module):
         in_channels=80,
         hidden_channels=192,
         utt_channels=512,
-        cond_channels=192,
         kernel_size=5,
         p_dropout=0.0,
         n_heads=2,
@@ -93,6 +93,7 @@ class MelStyleEncoder(nn.Module):
             dim_head=dim_head,
             heads=n_heads,
             ff_mult=4,
+            p_dropout=p_dropout,
         )
 
         # self attn
@@ -114,6 +115,7 @@ class MelStyleEncoder(nn.Module):
     def forward(self, x, x_mask=None):
         # spectral
         x = self.spectral(x) * x_mask
+
         # temporal
         x = self.temporal(x) * x_mask
 

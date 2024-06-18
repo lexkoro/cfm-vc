@@ -233,6 +233,7 @@ class PerceiverResampler(nn.Module):
         dim_head=64,
         heads=8,
         ff_mult=4,
+        p_dropout=0.0,
     ):
         super().__init__()
 
@@ -251,6 +252,7 @@ class PerceiverResampler(nn.Module):
                             dim_head=dim_head,
                             heads=heads,
                             use_flash=False,
+                            dropout=p_dropout,
                             cross_attn_include_queries=True,
                         ),
                         FeedForward(dim=hidden_channels, mult=ff_mult),

@@ -38,7 +38,10 @@ class AuxDecoder(nn.Module):
             input_channels, hidden_channels, kernel_size, padding=(kernel_size - 1) // 2
         )
         self.prenet = nn.Conv1d(
-            hidden_channels, hidden_channels, kernel_size=3, padding=1
+            hidden_channels,
+            hidden_channels,
+            kernel_size=kernel_size,
+            padding=(kernel_size - 1) // 2,
         )
 
         self.aux_decoder = attentions.Encoder(

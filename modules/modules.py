@@ -4,10 +4,120 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils.parametrizations import weight_norm
 
-from modules.commons import get_padding, init_weights
 from modules.wavenet.wavenet import WaveNet
 
 LRELU_SLOPE = 0.1
+
+
+class Block1D(torch.nn.Module):
+    """
+    Block1D module represents a 1-dimensional block in a neural network.
+
+    Args:
+        dim (int): The input dimension of the block.
+        dim_out (int): The output dimension of the block.
+        dropout (float, optional): The dropout rate. Defaults to 0.1.
+        utt_emb_dim (int, optional): The dimension of the utterance embedding. Defaults to 0.
+        norm_type (str, optional): The type of normalization to be applied.
+            Possible values are "condlayernorm", "condgroupnorm" and "layernorm". Defaults to "layernorm".
+    """
+
+    def __init__(self, dim, dim_out, dropout=0.1, utt_emb_dim=0, norm_type="layernorm"):
+        super().__init__()
+        self.conv1d = torch.nn.Conv1d(dim, dim_out, 3, padding=1)
+        self.norm_type = norm_type
+
+        if norm_type == "condlayernorm" and utt_emb_dim != 0:
+            self.norm = ConditionalLayerNorm(dim_out, utt_emb_dim)
+        elif norm_type == "layernorm":
+            self.norm = LayerNorm(dim_out)
+        else:
+            raise NotImplementedError("norm_type not implemented.")
+
+        self.mish = nn.Mish()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask, utt_emb=None):
+        """
+        Forward pass of the Block1D module.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+            mask (torch.Tensor): The mask tensor.
+            utt_emb (torch.Tensor, optional): The utterance embedding tensor. Defaults to None.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
+        output = self.conv1d(x * mask)
+        output = self.norm(output, utt_emb)
+        output = self.mish(output)
+        output = self.dropout(output)
+        return output * mask
+
+
+class ResnetBlock1D(torch.nn.Module):
+    """
+    Residual block for 1D ResNet.
+
+    Args:
+        dim_in (int): Number of input channels.
+        dim_out (int): Number of output channels.
+        dropout (float, optional): Dropout rate. Default is 0.1.
+        utt_emb_dim (int, optional): Dimension of utterance embedding. Default is 512.
+        norm_type (str, optional): The type of normalization to be applied.
+            Possible values are "condlayernorm", "condgroupnorm" and "layernorm". Defaults to "layernorm".
+    """
+
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        dropout: float = 0.1,
+        utt_emb_dim: int = 512,
+        norm_type: str = "layernorm",
+    ):
+        super().__init__()
+
+        self.norm_type = norm_type
+
+        self.block1 = Block1D(
+            dim_in,
+            dim_out,
+            dropout=dropout,
+            utt_emb_dim=utt_emb_dim,
+            norm_type=norm_type,
+        )
+        self.block2 = Block1D(
+            dim_out,
+            dim_out,
+            dropout=dropout,
+            utt_emb_dim=utt_emb_dim,
+            norm_type=norm_type,
+        )
+
+        self.res_conv = (
+            torch.nn.Conv1d(dim_in, dim_out, 1)
+            if dim_in != dim_out
+            else torch.nn.Identity()
+        )
+
+    def forward(self, x, mask, utt_emb=None):
+        """
+        Forward pass of the ResnetBlock1D.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, channels, sequence_length).
+            mask (torch.Tensor): Mask tensor of shape (batch_size, sequence_length).
+            utt_emb (torch.Tensor, optional): Utterance embedding tensor of shape (batch_size, utt_emb_dim).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, channels, sequence_length).
+        """
+        h = self.block1(x, mask, utt_emb)
+        h = self.block2(h, mask, utt_emb)
+        output = h + self.res_conv(x * mask)
+        return output
 
 
 class FiLM(nn.Module):
@@ -299,82 +409,6 @@ class ElementwiseAffine(nn.Module):
             return y, logdet
         else:
             x = (x - self.m) * torch.exp(-self.logs) * x_mask
-            return x
-
-
-class ResidualCouplingLayer(nn.Module):
-    def __init__(
-        self,
-        channels,
-        hidden_channels,
-        kernel_size,
-        dilation_rate,
-        n_layers,
-        p_dropout=0,
-        gin_channels=0,
-        cond_channels=0,
-        mean_only=False,
-    ):
-        assert channels % 2 == 0, "channels should be divisible by 2"
-        super().__init__()
-        self.channels = channels
-        self.hidden_channels = hidden_channels
-        self.kernel_size = kernel_size
-        self.half_channels = channels // 2
-        self.mean_only = mean_only
-
-        self.pre = nn.Conv1d(self.half_channels, hidden_channels, 1)
-        # # transformer
-        # self.attn = attentions.TransformerBlock(
-        #     self.hidden_channels,
-        #     nhead=4,
-        #     nhead_dim=64,
-        #     kernel_size=3,
-        #     p_dropout=0.1,
-        # )
-
-        # wavenet
-        self.enc = WaveNet(
-            kernel_size=kernel_size,
-            layers=n_layers,
-            stacks=1,
-            base_dilation=1,
-            residual_channels=hidden_channels,
-            aux_channels=cond_channels,
-            gate_channels=hidden_channels * 2,
-            skip_channels=hidden_channels,
-            global_channels=gin_channels,
-            dropout_rate=p_dropout,
-            bias=True,
-            use_weight_norm=True,
-            scale_residual=False,
-            scale_skip_connect=True,
-        )
-
-        self.post = nn.Conv1d(hidden_channels, self.half_channels * (2 - mean_only), 1)
-        self.post.weight.data.zero_()
-        self.post.bias.data.zero_()
-
-    def forward(self, x, x_mask, g=None, c=None, reverse=False):
-        x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
-        h = self.pre(x0) * x_mask
-        # h = self.attn(h, x_mask)
-        h = self.enc(h, x_mask, g=g, c=c)
-        stats = self.post(h) * x_mask
-        if not self.mean_only:
-            m, logs = torch.split(stats, [self.half_channels] * 2, 1)
-        else:
-            m = stats
-            logs = torch.zeros_like(m)
-
-        if not reverse:
-            x1 = m + x1 * torch.exp(logs) * x_mask
-            x = torch.cat([x0, x1], 1)
-            logdet = torch.sum(logs, [1, 2])
-            return x, logdet
-        else:
-            x1 = (x1 - m) * torch.exp(-logs) * x_mask
-            x = torch.cat([x0, x1], 1)
             return x
 
 

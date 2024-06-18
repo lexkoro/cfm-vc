@@ -1,6 +1,5 @@
 import gc
 import hashlib
-import io
 import json
 import logging
 import os
@@ -9,6 +8,7 @@ from pathlib import Path
 
 import librosa
 import numpy as np
+import ppgs
 
 # import onnxruntime
 import soundfile
@@ -17,6 +17,7 @@ import torchaudio
 
 import utils
 from models import SynthesizerTrn
+from modules.commons import dedup_seq
 from utils import audio_to_energy
 
 # from models_cf import SynthesizerTrn
@@ -166,7 +167,7 @@ class Svc(object):
         # get model configuration
         self.net_g_ms = SynthesizerTrn(
             self.hps_ms.data.n_mel_channels,
-            n_speakers=3743,
+            n_speakers=789,
             **self.hps_ms.model,
         )
         _ = utils.load_checkpoint(self.net_g_path, self.net_g_ms, None)
@@ -330,6 +331,21 @@ class Svc(object):
             cr_threshold=cr_threshold,
         )
 
+        # Load speech audio at correct sample rate
+        audio = ppgs.load.audio(raw_path)
+        # Infer PPGs
+        ppg = ppgs.from_audio(audio, ppgs.SAMPLE_RATE, gpu=None).float()
+        ppg = utils.repeat_expand_2d(ppg.squeeze(0), f0.shape[-1], mode="nearest")
+
+        sparse_ppg = ppgs.sparsify(
+            ppg=ppg, method="percentile", threshold=torch.Tensor([0.85])
+        )
+        most_probable_ppg = torch.argmax(sparse_ppg, dim=1)
+        ppg_features, ppg_durations = dedup_seq(most_probable_ppg)
+        ppg_features = ppg_features.to(self.dev)
+        ppg_durations = ppg_durations.to(self.dev)
+        ppg_features_lengths = torch.LongTensor([ppg_features.shape[1]]).to(self.dev)
+
         c = c.to(self.dtype)
         f0 = f0.to(self.dtype)
         uv = uv.to(self.dtype)
@@ -342,6 +358,9 @@ class Svc(object):
                 f0=f0,
                 uv=uv,
                 energy=energy,
+                ppg=ppg_features,
+                ppg_lengths=ppg_features_lengths,
+                ppg_dur=ppg_durations,
                 g=speaker_embedding,
                 n_timesteps=n_timesteps,
                 temperature=temperature,

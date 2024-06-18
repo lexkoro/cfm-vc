@@ -99,7 +99,6 @@ class Encoder(nn.Module):
         filter_channels,
         time_channels,
         n_heads,
-        n_layers,
         dim_head=None,
         kernel_size=1,
         p_dropout=0.0,
@@ -108,56 +107,39 @@ class Encoder(nn.Module):
         self.hidden_channels = hidden_channels
         self.filter_channels = filter_channels
         self.n_heads = n_heads
-        self.n_layers = n_layers
         self.kernel_size = kernel_size
 
-        self.attn_layers = nn.ModuleList()
+        # self attention
+        self.norm0 = ConditionalLayerNorm(hidden_channels, time_channels)
+        self.attn = MultiHeadAttention(
+            hidden_channels,
+            hidden_channels,
+            n_heads,
+            dim_head=dim_head,
+            p_dropout=p_dropout,
+        )
 
-        self.norm_layers_0 = nn.ModuleList()
-        self.norm_layers_1 = nn.ModuleList()
-
-        self.ffn_layers_1 = nn.ModuleList()
-
-        for i in range(self.n_layers):
-            self.norm_layers_0.append(
-                ConditionalLayerNorm(hidden_channels, time_channels)
-            )
-            self.attn_layers.append(
-                MultiHeadAttention(
-                    hidden_channels,
-                    hidden_channels,
-                    n_heads,
-                    dim_head=dim_head,
-                    p_dropout=p_dropout,
-                )
-            )
-
-            self.norm_layers_1.append(
-                ConditionalLayerNorm(hidden_channels, time_channels)
-            )
-            self.ffn_layers_1.append(
-                FFN(
-                    hidden_channels,
-                    hidden_channels,
-                    filter_channels,
-                    kernel_size=kernel_size,
-                    p_dropout=p_dropout,
-                )
-            )
+        # feed forward
+        self.norm1 = ConditionalLayerNorm(hidden_channels, time_channels)
+        self.ffn = FFN(
+            hidden_channels,
+            hidden_channels,
+            filter_channels,
+            kernel_size=kernel_size,
+            p_dropout=p_dropout,
+        )
 
     def forward(self, x, x_mask, t):
         # attn mask
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
 
-        for i in range(self.n_layers):
-            # self-attention
-            attn_input = self.norm_layers_0[i](x, t)
-            x = self.attn_layers[i](attn_input, attn_input, attn_mask) + x
+        # self-attention
+        attn_input = self.norm0(x, t)
+        x = self.attn(attn_input, c=attn_input, attn_mask=attn_mask) + x
 
-            # feed-forward
-            ffn_input = self.norm_layers_1[i](x, t)
-            x = self.ffn_layers_1[i](ffn_input, x_mask) + x
+        # feed-forward
+        x = self.ffn(self.norm1(x, t), x_mask) + x
 
         return x * x_mask
 
@@ -198,7 +180,6 @@ class DitWrapper(nn.Module):
             time_channels=time_channels,
             n_heads=num_heads,
             dim_head=dim_head,
-            n_layers=1,
             kernel_size=kernel_size,
             p_dropout=p_dropout,
         )
@@ -302,8 +283,10 @@ class DiT(nn.Module):
                 )
             )
 
-        self.final_block = Block1D(hidden_channels, hidden_channels)
-        self.final_proj = nn.Conv1d(hidden_channels, out_channels, 1)
+        self.final_proj = nn.Sequential(
+            LayerNorm(hidden_channels),
+            nn.Conv1d(hidden_channels, out_channels, 1, bias=False),
+        )
 
     def forward(self, x, mask, mu, t, spks=None):
         """Forward pass of the UNet1DConditional model.
@@ -335,7 +318,6 @@ class DiT(nn.Module):
             x = torch.cat([x, skip_x], dim=1)
             x = block(x, spks, t, mask)
 
-        x = self.final_block(x, mask)
         output = self.final_proj(x * mask)
 
         return output * mask

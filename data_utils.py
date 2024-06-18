@@ -52,16 +52,6 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.audiopaths = self._filter_long_files(self.audiopaths)
 
     def _filter_long_files(self, audio_paths):
-        filtered = []
-
-        # for p, speaker in audio_paths:
-        #     if (
-        #         self.min_file_length
-        #         < (Path(p).stat().st_size // 2)
-        #         < self.max_file_length
-        #     ):
-        #         filtered.append([p, speaker])
-
         self.unique_speaker_count = len(set([x[1] for x in audio_paths]))
 
         print("Unique speakers:", self.unique_speaker_count)
@@ -108,6 +98,12 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             self.mel_fmax,
         )
 
+        # ppg unit and duration
+        ppg_path = filename.replace(".wav", ".ppg_unit.pt")
+        ppg = torch.load(ppg_path)
+        ppg_unit = ppg["ppg_unit"]
+        ppg_unit_dur = ppg["ppg_unit_dur"]
+
         # load f0 and uv
         f0_path = filename.replace(".wav", ".rmvpe.pt")
         loaded_data = torch.load(f0_path)
@@ -139,27 +135,25 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             uv[:lmin],
             energy[:, :lmin],
         )
-        audio_norm = audio_norm[:, : lmin * self.hop_length]
 
         # speaker id
         speaker_id = torch.LongTensor([int(speaker_id)])
 
-        return c, f0, spec, audio_norm, uv, energy, speaker_id
+        return c, f0, spec, uv, energy, speaker_id, ppg_unit, ppg_unit_dur
 
-    def random_slice(self, c, f0, spec, audio_norm, uv, energy, speaker_id):
-        if spec.shape[1] > self.num_frames:
-            start = random.randint(0, spec.shape[1] - self.num_frames)
-            end = start + self.num_frames - 1
-            spec, c, f0, uv, energy = (
-                spec[:, start:end],
-                c[:, start:end],
-                f0[:, start:end],
-                uv[start:end],
-                energy[:, start:end],
-            )
-            audio_norm = audio_norm[:, start * self.hop_length : end * self.hop_length]
+    def random_slice(self, c, f0, spec, uv, energy, speaker_id, ppg_unit, ppg_unit_dur):
+        # if spec.shape[1] > self.num_frames:
+        #     start = random.randint(0, spec.shape[1] - self.num_frames)
+        #     end = start + self.num_frames - 1
+        #     spec, c, f0, uv, energy = (
+        #         spec[:, start:end],
+        #         c[:, start:end],
+        #         f0[:, start:end],
+        #         uv[start:end],
+        #         energy[:, start:end],
+        #     )
 
-        return c, f0, spec, audio_norm, uv, energy, speaker_id
+        return c, f0, spec, uv, energy, speaker_id, ppg_unit, ppg_unit_dur
 
     def __getitem__(self, index):
         if self.all_in_mem:
@@ -180,24 +174,27 @@ class TextAudioCollate:
         )
 
         max_c_len = max([x[0].size(1) for x in batch])
-        max_wav_len = max([x[3].size(1) for x in batch])
+        max_ppg_len = max([x[6].size(0) for x in batch])
 
         lengths = torch.LongTensor(len(batch))
+        ppg_lengths = torch.LongTensor(len(batch))
         sid = torch.LongTensor(len(batch))
 
         c_padded = torch.FloatTensor(len(batch), batch[0][0].shape[0], max_c_len)
         f0_padded = torch.FloatTensor(len(batch), 1, max_c_len)
         spec_padded = torch.FloatTensor(len(batch), batch[0][2].shape[0], max_c_len)
-        wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
         uv_padded = torch.FloatTensor(len(batch), max_c_len)
         energy_padded = torch.FloatTensor(len(batch), 1, max_c_len)
+        ppg_unit_padded = torch.LongTensor(len(batch), max_ppg_len)
+        ppg_unit_dur_padded = torch.FloatTensor(len(batch), max_ppg_len)
 
         c_padded.zero_()
         spec_padded.zero_()
         f0_padded.zero_()
-        wav_padded.zero_()
         uv_padded.zero_()
         energy_padded.zero_()
+        ppg_unit_padded.zero_()
+        ppg_unit_dur_padded.zero_()
 
         for i in range(len(ids_sorted_decreasing)):
             row = batch[ids_sorted_decreasing[i]]
@@ -212,26 +209,32 @@ class TextAudioCollate:
             spec = row[2]
             spec_padded[i, :, : spec.size(1)] = spec
 
-            wav = row[3]
-            wav_padded[i, :, : wav.size(1)] = wav
-
-            uv = row[4]
+            uv = row[3]
             uv_padded[i, : uv.size(0)] = uv
 
-            energy = row[5]
+            energy = row[4]
             energy_padded[i, 0, : energy.size(1)] = energy
 
-            sid[i] = row[6]
+            sid[i] = row[5]
+
+            ppg = row[6]
+            ppg_unit_padded[i, : ppg.size(0)] = ppg
+            ppg_lengths[i] = ppg.size(0)
+
+            ppg_dur = row[7]
+            ppg_unit_dur_padded[i, : ppg_dur.size(0)] = ppg_dur
 
         return (
             c_padded,
             f0_padded,
             spec_padded,
-            wav_padded,
             lengths,
             uv_padded,
             energy_padded,
             sid,
+            ppg_unit_padded,
+            ppg_lengths,
+            ppg_unit_dur_padded,
         )
 
 
