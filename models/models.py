@@ -53,13 +53,6 @@ class SynthesizerTrn(nn.Module):
             p_dropout=p_dropout,
         )
 
-        # # speaker classifier
-        # self.speaker_classifier = SpeakerClassifier(
-        #     in_channels=hidden_channels,
-        #     hidden_channels=filter_channels,
-        #     n_speakers=n_speakers,
-        # )
-
         # Speaker Encoder
         self.speaker_encoder = PerceiverResampler(
             in_channels=spec_channels,
