@@ -1,132 +1,170 @@
 import torch
 import torch.nn as nn
-from torchdyn.core import NeuralODE
+from torch.distributions import LogisticNormal
 
 from modules.cfm.dit import DiT
 
 
-class Wrapper(nn.Module):
-    def __init__(
-        self, vector_field_net, mask, mu, spk, cond, cond_mask, guidance_scale
-    ):
-        super(Wrapper, self).__init__()
-        self.net = vector_field_net
-        self.mask = mask
-        self.mu = mu
-        self.spk = spk
-        self.cond = cond
-        self.cond_mask = cond_mask
-        self.guidance_scale = guidance_scale
+class LogitNormalTrainingTimesteps:
+    def __init__(self, T=1000.0, loc=0.0, scale=1.0):
+        assert T > 0
+        self.T = T
+        self.dist = LogisticNormal(loc, scale)
 
-    def forward(self, t, x, args):
-        # NOTE: args cannot be dropped here. This function signature is strictly required by the NeuralODE class
-        t = torch.tensor([t], device=t.device)
-
-        dphi_dt = self.net(
-            x, self.mask, self.mu, t, self.spk, self.cond, self.cond_mask
-        )
-
-        # if self.guidance_scale > 0:
-        #     mu_avg = self.mu.mean(2, keepdims=True).expand_as(self.mu)
-        #     dphi_avg = self.net(
-        #         x, self.mask, mu_avg, t, self.spk, self.cond, self.cond_mask
-        #     )
-        #     dphi_dt = dphi_dt + self.guidance_scale * (dphi_dt - dphi_avg)
-
-        # Classifier-Free Guidance inference introduced in VoiceBox
-        if self.guidance_scale > 0:
-            cfg_dphi_dt = self.net(
-                x,
-                self.mask,
-                torch.zeros_like(self.mu),
-                t,
-                self.spk,
-                torch.zeros_like(self.cond),
-                self.cond_mask,
-            )
-            dphi_dt = (
-                1.0 + self.guidance_scale
-            ) * dphi_dt - self.guidance_scale * cfg_dphi_dt
-
-        return dphi_dt
+    def sample(self, size, device):
+        samples = self.dist.sample(size)
+        if samples is None:
+            raise RuntimeError("LogisticNormal timestep sampler returned None")
+        t = samples[..., 0].to(device)
+        return t
 
 
 class ConditionalFlowMatching(nn.Module):
     def __init__(
         self,
-        estimator_params={
-            "in_channels": 80,
-            "hidden_channels": 192,
-            "out_channels": 80,
-            "filter_channels": 768,
-            "dropout": 0.05,
-            "n_layers": 6,
-            "n_heads": 4,
-            "dim_head": None,
-            "kernel_size": 3,
-        },
+        in_channels=80,
+        hidden_channels=192,
+        filter_channels=768,
+        out_channels=80,
+        n_layers=6,
+        n_heads=4,
+        dim_head=None,
+        kernel_size=3,
+        p_dropout=0.05,
+        use_skip_connections=False,
         sigma_min: float = 1e-06,
     ):
-        super(ConditionalFlowMatching, self).__init__()
+        super().__init__()
         self.sigma_min = sigma_min
 
-        self.out_channels = estimator_params["out_channels"]
+        self.time_sampler = LogitNormalTrainingTimesteps()
+
+        self.out_channels = out_channels
 
         self.estimator = DiT(
-            in_channels=estimator_params["in_channels"],
-            hidden_channels=estimator_params["hidden_channels"],
-            out_channels=estimator_params["out_channels"],
-            filter_channels=estimator_params["filter_channels"],
-            n_layers=estimator_params["n_layers"],
-            n_heads=estimator_params["n_heads"],
-            dim_head=estimator_params["dim_head"],
-            num_registers=32,
-            kernel_size=estimator_params["kernel_size"],
-            p_dropout=estimator_params["dropout"],
+            in_channels=in_channels,
+            hidden_channels=hidden_channels,
+            out_channels=out_channels,
+            filter_channels=filter_channels,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            dim_head=dim_head,
+            kernel_size=kernel_size,
+            p_dropout=p_dropout,
+            use_skip_connections=use_skip_connections,
         )
 
-    def ode_wrapper(self, mask, mu, spk, cond, cond_mask, guidance_scale):
-        # self.estimator receives x, mask, mu, t, spk as arguments
-        return Wrapper(self.estimator, mask, mu, spk, cond, cond_mask, guidance_scale)
+    def func_dphi_dt(self, x, mask, mu, cond_mel, t, guidance_scale=0.0):
+        dphi_dt = self.estimator(x, mask, mu, cond_mel, t)
+        if guidance_scale > 0:
+            cfg_dphi_dt = self.estimator(x, mask, torch.zeros_like(mu), cond_mel, t)
+            dphi_dt = (1.0 + guidance_scale) * dphi_dt - guidance_scale * cfg_dphi_dt
+        return dphi_dt
+
+    def solve_fixed_step(
+        self,
+        x,
+        mask,
+        mu,
+        cond_mel,
+        prompt_mask,
+        t_span,
+        guidance_scale,
+        solver,
+    ):
+        t = t_span[0]
+        for step in range(1, len(t_span)):
+            dt = t_span[step] - t
+            dphi_dt = self.func_dphi_dt(x, mask, mu, cond_mel, t, guidance_scale)
+
+            if solver == "euler":
+                x = x + dt * dphi_dt
+            elif solver == "heun":
+                dphi_dt_2 = self.func_dphi_dt(
+                    x + dt * dphi_dt,
+                    mask,
+                    mu,
+                    cond_mel,
+                    t + dt,
+                    guidance_scale,
+                )
+                x = x + dt * 0.5 * (dphi_dt + dphi_dt_2)
+            elif solver == "midpoint":
+                dphi_dt_2 = self.func_dphi_dt(
+                    x + dt * 0.5 * dphi_dt,
+                    mask,
+                    mu,
+                    cond_mel,
+                    t + dt * 0.5,
+                    guidance_scale,
+                )
+                x = x + dt * dphi_dt_2
+            else:
+                raise ValueError(f"Unsupported fixed-step solver: {solver}")
+
+            # Keep prompt frames fixed so target conditioning cannot drift.
+            x = torch.where(prompt_mask, cond_mel, x)
+
+            t = t + dt
+
+        return x
+
+    def build_prefix_mask(self, lengths, max_len):
+        positions = torch.arange(max_len, device=lengths.device).unsqueeze(0)
+        return (positions < lengths.unsqueeze(1)).unsqueeze(1)
 
     @torch.no_grad()
     def inference(
         self,
-        z,
-        mask,
         mu,
+        mask,
+        target_condition,
+        source_lengths,
+        target_lengths,
         n_timesteps,
-        spk=None,
-        cond=None,
-        cond_mask=None,
+        temperature=1.0,
         guidance_scale=0.0,
-        solver="dopri5",
+        solver="euler",
     ):
-        t_span = torch.linspace(
-            0, 1, n_timesteps + 1, device=mu.device
-        )  # NOTE: n_timesteps means n+1 points in [0, 1]
+        t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
         t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
 
-        neural_ode = NeuralODE(
-            self.ode_wrapper(mask, mu, spk, cond, cond_mask, guidance_scale),
-            solver=solver,
-            sensitivity="adjoint",
-            atol=1e-4,
-            rtol=1e-4,
+        source_noise = (
+            torch.randn(
+                size=(mu.size(0), self.out_channels, source_lengths.max()),
+                dtype=mu.dtype,
+                device=mu.device,
+            )
+            * temperature
         )
 
-        x = z
-        _, traj = neural_ode(x, t_span)
+        x = torch.cat([target_condition, source_noise], dim=-1)
+        cond_mel = torch.cat([target_condition, torch.zeros_like(source_noise)], dim=-1)
+        prompt_mask = self.build_prefix_mask(target_lengths, x.size(-1))
 
-        return traj[-1]
+        assert solver in ["euler", "heun", "midpoint"], f"Unsupported solver: {solver}"
 
-    def sample_x0(self, mu, mask):
-        x0 = torch.randn_like(mu)  # N(0,1)
+        # Ensure a clean prompt at t=0 before solving the generated region.
+        x = torch.where(prompt_mask, cond_mel, x)
+
+        return self.solve_fixed_step(
+            x=x,
+            mask=mask,
+            mu=mu,
+            cond_mel=cond_mel,
+            prompt_mask=prompt_mask,
+            t_span=t_span,
+            guidance_scale=guidance_scale,
+            solver=solver,
+        )
+
+    def sample_x0(self, x1, mask):
+        x0 = torch.randn_like(x1)  # N(0,1)
         x0 = x0 * mask
 
         return x0
 
-    def forward(self, x1, mask, mu, spk, cond, cond_mask):
+    def forward(self, x1, mask, mu, prompt_mask):
         b, _, t = mu.shape
 
         t = torch.rand([b, 1, 1], dtype=x1.dtype, device=x1.device, requires_grad=False)
@@ -134,87 +172,30 @@ class ConditionalFlowMatching(nn.Module):
 
         cfg_mask = torch.rand(b, device=x1.device) > 0.2
         mu = mu * cfg_mask.view(-1, 1, 1)
-        cond = cond * cfg_mask.view(-1, 1, 1)
 
-        return self.loss_t(x1, mask, mu, t, spk, cond, cond_mask)
+        prompt_mask = prompt_mask.bool() & mask.bool()
+        generation_mask = mask.bool() & ~prompt_mask
+        cond_mel = x1 * prompt_mask.to(x1.dtype)
 
-    def loss_t(self, x1, mask, mu, t, spk, cond, cond_mask):
-        # sample noise p(x_0)
         z = self.sample_x0(x1, mask)
 
-        y = (1 - (1 - self.sigma_min) * t) * z + t * x1
+        x_t = (1 - (1 - self.sigma_min) * t) * z + t * x1
         u = x1 - (1 - self.sigma_min) * z
 
         vector_field_estimation = self.estimator(
-            y, mask, mu, t.squeeze(), spk, cond, cond_mask
+            x_t,
+            mask,
+            mu,
+            cond_mel,
+            t.squeeze(),
         )
+
+        if not generation_mask.any():
+            generation_mask = mask.bool()
 
         mse_loss = torch.nn.functional.mse_loss(
-            torch.masked_select(vector_field_estimation, mask.bool()),
-            torch.masked_select(u, mask.bool()),
+            torch.masked_select(vector_field_estimation, generation_mask),
+            torch.masked_select(u, generation_mask),
         )
 
-        return mse_loss, vector_field_estimation
-
-
-# class OTCFM(ConditionalFlowMatching):
-#     def __init__(
-#         self,
-#         estimator_params={
-#             "in_channels": 80,
-#             "hidden_channels": 192,
-#             "out_channels": 80,
-#             "filter_channels": 768,
-#             "dropout": 0.05,
-#             "n_layers": 6,
-#             "n_heads": 4,
-#             "dim_head": None,
-#             "kernel_size": 3,
-#         },
-#         sigma_min: float = 1e-06,
-#     ):
-#         super(OTCFM, self).__init__(
-#             estimator_params=estimator_params, sigma_min=sigma_min
-#         )
-
-#         # self.ot_matcher = ExactOptimalTransportConditionalFlowMatcher(sigma=0)
-#         self.ot_sampler = OTPlanSampler(method="exact")
-
-#     def loss_t(self, x1, mask, mu, t, spk, cond, cond_mask):
-#         x0 = self.sample_x0(mu, mask)
-
-#         # x1 and x0 shape is [B, 80, L]
-#         B, D, L = x0.shape
-#         new_x0 = torch.zeros_like(x1)
-#         new_x1 = torch.zeros_like(x0)
-#         for l in range(L):
-#             sub_x0, sub_x1, i, j = self.ot_sampler.sample_plan_with_index(
-#                 x1[..., l], x0[..., l], replace=False
-#             )
-#             index_that_would_sort_i = np.argsort(
-#                 i
-#             )  # To keep i and j synchronized for each position in L
-#             i = i[index_that_would_sort_i]
-#             j = j[index_that_would_sort_i]
-
-#             new_x0[..., l] = x1[i, :, l]
-#             new_x1[..., l] = x0[j, :, l]
-
-#         x1 = new_x0
-#         x0 = new_x1
-
-#         ut = x1 - x0  # conditional vector field. This is actually x0 - x1 in paper.
-#         mu_t = t * x1 + (1 - t) * x0  # conditional Gaussian mean
-#         sigma_t = self.sigma_min
-#         x = mu_t + sigma_t * torch.randn_like(x1)  # sample p_t(x|x_0, x_1)
-
-#         vector_field_estimation = self.estimator(
-#             x, mask, mu, t.squeeze(), spk, cond, cond_mask
-#         )
-
-#         mse_loss = torch.nn.functional.mse_loss(
-#             torch.masked_select(vector_field_estimation, mask.bool()),
-#             torch.masked_select(ut, mask.bool()),
-#         )
-
-#         return mse_loss, vector_field_estimation
+        return mse_loss, vector_field_estimation, generation_mask

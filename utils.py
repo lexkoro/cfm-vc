@@ -7,49 +7,19 @@ import os
 import re
 import subprocess
 import sys
-import traceback
-from multiprocessing import cpu_count
 
-import faiss
-import librosa
 import numpy as np
 import torch
 from scipy.io.wavfile import read
-from sklearn.cluster import MiniBatchKMeans
 from torch.nn import functional as F
-
-from modules.mel_processing import mel_spectrogram_torch, spectral_de_normalize_torch
 
 MATPLOTLIB_FLAG = False
 
 logging.basicConfig(stream=sys.stdout, level=logging.WARN)
 logger = logging
 
-f0_bin = 256
-f0_max = 1100.0
-f0_min = 50.0
-f0_mel_min = 1127 * np.log(1 + f0_min / 700)
-f0_mel_max = 1127 * np.log(1 + f0_max / 700)
 
-
-def normalize_f0(f0, x_mask, uv, random_scale=True):
-    # calculate means based on x_mask
-    uv_sum = torch.sum(uv, dim=1, keepdim=True)
-    uv_sum[uv_sum == 0] = 9999
-    means = torch.sum(f0[:, 0, :] * uv, dim=1, keepdim=True) / uv_sum
-
-    if random_scale:
-        factor = torch.Tensor(f0.shape[0], 1).uniform_(0.8, 1.2).to(f0.device)
-    else:
-        factor = torch.ones(f0.shape[0], 1).to(f0.device)
-    # normalize f0 based on means and factor
-    f0_norm = (f0 - means.unsqueeze(-1)) * factor.unsqueeze(-1)
-    if torch.isnan(f0_norm).any():
-        exit(0)
-    return f0_norm * x_mask
-
-
-def plot_data_to_numpy(x, y):
+def _get_matplotlib_pyplot():
     global MATPLOTLIB_FLAG
     if not MATPLOTLIB_FLAG:
         import matplotlib
@@ -59,121 +29,29 @@ def plot_data_to_numpy(x, y):
         mpl_logger = logging.getLogger("matplotlib")
         mpl_logger.setLevel(logging.WARNING)
     import matplotlib.pylab as plt
-    import numpy as np
 
-    fig, ax = plt.subplots(figsize=(10, 2))
-    plt.plot(x)
-    plt.plot(y)
-    plt.tight_layout()
+    return plt
 
+
+def _figure_to_numpy(fig, close=True):
     fig.canvas.draw()
-    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep="")
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    plt.close()
+    # Keep image output consistent as RGB for tensorboard HWC logging.
+    data = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)[..., :3].copy()
+    if close:
+        plt = _get_matplotlib_pyplot()
+        plt.close(fig)
     return data
 
 
-energy_bin = 256
+def plot_data_to_numpy(x, y):
+    plt = _get_matplotlib_pyplot()
 
+    fig, ax = plt.subplots(figsize=(10, 2))
+    ax.plot(x)
+    ax.plot(y)
+    fig.tight_layout()
 
-def energy_to_coarse(energy, use_local_max=False, energy_max=400, energy_min=0):
-    is_torch = isinstance(energy, torch.Tensor)
-
-    energy = energy.clone() if is_torch else energy.copy()
-
-    if use_local_max:
-        energy[energy > 0] = (energy[energy > 0] - energy_min) * (energy_bin - 2) / (
-            energy.max() - energy_min
-        ) + 1
-    else:
-        energy[energy > 0] = (energy[energy > 0] - energy_min) * (energy_bin - 2) / (
-            energy_max - energy_min
-        ) + 1
-
-    energy[energy <= 1] = 1
-    energy[energy > energy_bin - 1] = energy_bin - 1
-    energy_coarse = (
-        (energy + 0.5).long() if is_torch else np.rint(energy).astype(np.int)
-    )
-    assert energy_coarse.max() <= 255 and energy_coarse.min() >= 1, (
-        energy_coarse.max(),
-        energy_coarse.min(),
-    )
-    return energy_coarse
-
-
-def f0_to_coarse(f0):
-    f0_mel = 1127 * (1 + f0 / 700).log()
-    a = (f0_bin - 2) / (f0_mel_max - f0_mel_min)
-    b = f0_mel_min * a - 1.0
-    f0_mel = torch.where(f0_mel > 0, f0_mel * a - b, f0_mel)
-    # torch.clip_(f0_mel, min=1., max=float(f0_bin - 1))
-    f0_coarse = torch.round(f0_mel).long()
-    f0_coarse = f0_coarse * (f0_coarse > 0)
-    f0_coarse = f0_coarse + ((f0_coarse < 1) * 1)
-    f0_coarse = f0_coarse * (f0_coarse < f0_bin)
-    f0_coarse = f0_coarse + ((f0_coarse >= f0_bin) * (f0_bin - 1))
-    return f0_coarse
-
-
-def audio_to_energy(
-    y,
-    filter_length,
-    n_mel_channels,
-    sampling_rate,
-    hop_length,
-    win_length,
-    mel_fmin,
-    mel_fmax,
-):
-    mel = mel_spectrogram_torch(
-        y,
-        filter_length,
-        n_mel_channels,
-        sampling_rate,
-        hop_length,
-        win_length,
-        mel_fmin,
-        mel_fmax,
-    )
-    return mel_to_energy(mel)
-
-
-def mel_to_energy(mel):
-    mel = spectral_de_normalize_torch(mel)
-    avg_power = torch.mean(mel, dim=1)
-    return avg_power
-
-
-def compute_energy(
-    y,
-    filter_length,
-    n_mel_channels,
-    sampling_rate,
-    hop_length,
-    win_length,
-    mel_fmin,
-    mel_fmax,
-):
-    mel = mel_spectrogram_torch(
-        y,
-        filter_length,
-        n_mel_channels,
-        sampling_rate,
-        hop_length,
-        win_length,
-        mel_fmin,
-        mel_fmax,
-    )
-
-    mag = torch.abs(mel)
-
-    print(mag.shape)
-
-    # Calculate energy
-    energy = torch.sqrt(torch.sum(mag**2, dim=1))
-
-    return energy
+    return _figure_to_numpy(fig)
 
 
 def get_content(cmodel, y):
@@ -181,117 +59,6 @@ def get_content(cmodel, y):
         c = cmodel.extract_features(y.squeeze(1))[0]
     c = c.transpose(1, 2)
     return c
-
-
-def get_f0_predictor(f0_predictor, hop_length, sampling_rate, **kargs):
-    if f0_predictor == "pm":
-        from modules.F0Predictor.PMF0Predictor import PMF0Predictor
-
-        f0_predictor_object = PMF0Predictor(
-            hop_length=hop_length, sampling_rate=sampling_rate
-        )
-    elif f0_predictor == "crepe":
-        from modules.F0Predictor.CrepeF0Predictor import CrepeF0Predictor
-
-        f0_predictor_object = CrepeF0Predictor(
-            hop_length=hop_length,
-            sampling_rate=sampling_rate,
-            device=kargs["device"],
-            threshold=kargs["threshold"],
-        )
-    elif f0_predictor == "harvest":
-        from modules.F0Predictor.HarvestF0Predictor import HarvestF0Predictor
-
-        f0_predictor_object = HarvestF0Predictor(
-            hop_length=hop_length, sampling_rate=sampling_rate
-        )
-    elif f0_predictor == "dio":
-        from modules.F0Predictor.DioF0Predictor import DioF0Predictor
-
-        f0_predictor_object = DioF0Predictor(
-            hop_length=hop_length, sampling_rate=sampling_rate
-        )
-    elif f0_predictor == "rmvpe":
-        from modules.F0Predictor.RMVPEF0Predictor import RMVPEF0Predictor
-
-        f0_predictor_object = RMVPEF0Predictor(
-            hop_length=hop_length,
-            sampling_rate=sampling_rate,
-            dtype=torch.float32,
-            device=kargs["device"],
-            threshold=kargs["threshold"],
-        )
-    elif f0_predictor == "fcpe":
-        from modules.F0Predictor.FCPEF0Predictor import FCPEF0Predictor
-
-        f0_predictor_object = FCPEF0Predictor(
-            hop_length=hop_length,
-            sampling_rate=sampling_rate,
-            dtype=torch.float32,
-            device=kargs["device"],
-            threshold=kargs["threshold"],
-        )
-    else:
-        raise Exception("Unknown f0 predictor")
-    return f0_predictor_object
-
-
-def get_speech_encoder(speech_encoder, device=None, **kargs):
-    if speech_encoder == "vec768l12":
-        from vencoder.ContentVec768L12 import ContentVec768L12
-
-        speech_encoder_object = ContentVec768L12(device=device)
-    elif speech_encoder == "vec256l9":
-        from vencoder.ContentVec256L9 import ContentVec256L9
-
-        speech_encoder_object = ContentVec256L9(device=device)
-    elif speech_encoder == "vec256l9-onnx":
-        from vencoder.ContentVec256L9_Onnx import ContentVec256L9_Onnx
-
-        speech_encoder_object = ContentVec256L9_Onnx(device=device)
-    elif speech_encoder == "vec256l12-onnx":
-        from vencoder.ContentVec256L12_Onnx import ContentVec256L12_Onnx
-
-        speech_encoder_object = ContentVec256L12_Onnx(device=device)
-    elif speech_encoder == "vec768l9-onnx":
-        from vencoder.ContentVec768L9_Onnx import ContentVec768L9_Onnx
-
-        speech_encoder_object = ContentVec768L9_Onnx(device=device)
-    elif speech_encoder == "vec768l12-onnx":
-        from vencoder.ContentVec768L12_Onnx import ContentVec768L12_Onnx
-
-        speech_encoder_object = ContentVec768L12_Onnx(device=device)
-    elif speech_encoder == "hubertsoft-onnx":
-        from vencoder.HubertSoft_Onnx import HubertSoft_Onnx
-
-        speech_encoder_object = HubertSoft_Onnx(device=device)
-    elif speech_encoder == "hubertsoft":
-        from vencoder.HubertSoft import HubertSoft
-
-        speech_encoder_object = HubertSoft(device=device)
-    elif speech_encoder == "whisper-ppg":
-        from vencoder.WhisperPPG import WhisperPPG
-
-        speech_encoder_object = WhisperPPG(device=device)
-    elif speech_encoder == "cnhubertlarge":
-        from vencoder.CNHubertLarge import CNHubertLarge
-
-        speech_encoder_object = CNHubertLarge(device=device)
-    elif speech_encoder == "dphubert":
-        from vencoder.DPHubert import DPHubert
-
-        speech_encoder_object = DPHubert(device=device)
-    elif speech_encoder == "whisper-ppg-large":
-        from vencoder.WhisperPPGLarge import WhisperPPGLarge
-
-        speech_encoder_object = WhisperPPGLarge(device=device)
-    elif speech_encoder == "wavlmbase+":
-        from vencoder.WavLMBasePlus import WavLMBasePlus
-
-        speech_encoder_object = WavLMBasePlus(device=device)
-    else:
-        raise Exception("Unknown speech encoder")
-    return speech_encoder_object
 
 
 def mle_loss(z, m, logs, mask):
@@ -456,46 +223,24 @@ def latest_checkpoint_path(dir_path, regex="G_default_*.pth"):
 
 
 def plot_spectrogram_to_numpy(spectrogram, return_figure=False):
-    global MATPLOTLIB_FLAG
-    if not MATPLOTLIB_FLAG:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        MATPLOTLIB_FLAG = True
-        mpl_logger = logging.getLogger("matplotlib")
-        mpl_logger.setLevel(logging.WARNING)
-    import matplotlib.pylab as plt
-    import numpy as np
+    plt = _get_matplotlib_pyplot()
 
     fig, ax = plt.subplots(figsize=(10, 2))
     im = ax.imshow(spectrogram, aspect="auto", origin="lower", interpolation="none")
-    plt.colorbar(im, ax=ax)
-    plt.xlabel("Frames")
-    plt.ylabel("Channels")
-    plt.tight_layout()
+    fig.colorbar(im, ax=ax)
+    ax.set_xlabel("Frames")
+    ax.set_ylabel("Channels")
+    fig.tight_layout()
 
-    fig.canvas.draw()
-    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep="")
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    plt.close()
+    data = _figure_to_numpy(fig, close=not return_figure)
 
     if return_figure:
         return data, fig
-    else:
-        return data
+    return data
 
 
 def plot_alignment_to_numpy(alignment, info=None):
-    global MATPLOTLIB_FLAG
-    if not MATPLOTLIB_FLAG:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        MATPLOTLIB_FLAG = True
-        mpl_logger = logging.getLogger("matplotlib")
-        mpl_logger.setLevel(logging.WARNING)
-    import matplotlib.pylab as plt
-    import numpy as np
+    plt = _get_matplotlib_pyplot()
 
     fig, ax = plt.subplots(figsize=(6, 4))
     im = ax.imshow(
@@ -505,15 +250,11 @@ def plot_alignment_to_numpy(alignment, info=None):
     xlabel = "Decoder timestep"
     if info is not None:
         xlabel += "\n\n" + info
-    plt.xlabel(xlabel)
-    plt.ylabel("Encoder timestep")
-    plt.tight_layout()
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Encoder timestep")
+    fig.tight_layout()
 
-    fig.canvas.draw()
-    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep="")
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    plt.close()
-    return data
+    return _figure_to_numpy(fig)
 
 
 def load_wav_to_torch(full_path):
@@ -654,147 +395,6 @@ def repeat_expand_2d_other(content, target_len, mode="nearest"):
     content = content[None, :, :]
     target = F.interpolate(content, size=target_len, mode=mode)[0]
     return target
-
-
-def mix_model(model_paths, mix_rate, mode):
-    mix_rate = torch.FloatTensor(mix_rate) / 100
-    model_tem = torch.load(model_paths[0])
-    models = [torch.load(path)["model"] for path in model_paths]
-    if mode == 0:
-        mix_rate = F.softmax(mix_rate, dim=0)
-    for k in model_tem["model"].keys():
-        model_tem["model"][k] = torch.zeros_like(model_tem["model"][k])
-        for i, model in enumerate(models):
-            model_tem["model"][k] += model[k] * mix_rate[i]
-    torch.save(model_tem, os.path.join(os.path.curdir, "output.pth"))
-    return os.path.join(os.path.curdir, "output.pth")
-
-
-def change_rms(
-    data1, sr1, data2, sr2, rate
-):  # 1是输入音频，2是输出音频,rate是2的占比 from RVC
-    # print(data1.max(),data2.max())
-    rms1 = librosa.feature.rms(
-        y=data1, frame_length=sr1 // 2 * 2, hop_length=sr1 // 2
-    )  # 每半秒一个点
-    rms2 = librosa.feature.rms(
-        y=data2.detach().cpu().numpy(), frame_length=sr2 // 2 * 2, hop_length=sr2 // 2
-    )
-    rms1 = torch.from_numpy(rms1).to(data2.device)
-    rms1 = F.interpolate(
-        rms1.unsqueeze(0), size=data2.shape[0], mode="linear"
-    ).squeeze()
-    rms2 = torch.from_numpy(rms2).to(data2.device)
-    rms2 = F.interpolate(
-        rms2.unsqueeze(0), size=data2.shape[0], mode="linear"
-    ).squeeze()
-    rms2 = torch.max(rms2, torch.zeros_like(rms2) + 1e-6)
-    data2 *= torch.pow(rms1, torch.tensor(1 - rate)) * torch.pow(
-        rms2, torch.tensor(rate - 1)
-    )
-    return data2
-
-
-def train_index(
-    file_list,
-):  # from: RVC https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI
-    n_cpu = cpu_count()
-    print("The feature index is constructing.")
-
-    np.random.shuffle(file_list)
-
-    listdir_res = file_list[:50]
-
-    if len(listdir_res) == 0:
-        raise Exception("You need to run preprocess_hubert_f0.py!")
-    npys = []
-    for name in sorted(listdir_res):
-        phone = torch.load(name)[0].transpose(-1, -2).numpy()
-        npys.append(phone)
-    big_npy = np.concatenate(npys, 0)
-    big_npy_idx = np.arange(big_npy.shape[0])
-    np.random.shuffle(big_npy_idx)
-    big_npy = big_npy[big_npy_idx]
-    if big_npy.shape[0] > 2e5:
-        # if(1):
-        info = "Trying doing kmeans %s shape to 10k centers." % big_npy.shape[0]
-        print(info)
-        try:
-            big_npy = (
-                MiniBatchKMeans(
-                    n_clusters=10000,
-                    verbose=True,
-                    batch_size=256 * n_cpu,
-                    compute_labels=False,
-                    init="random",
-                )
-                .fit(big_npy)
-                .cluster_centers_
-            )
-        except Exception:
-            info = traceback.format_exc()
-            print(info)
-    n_ivf = min(int(16 * np.sqrt(big_npy.shape[0])), big_npy.shape[0] // 39)
-    index = faiss.index_factory(big_npy.shape[1], "IVF%s,Flat" % n_ivf)
-    index_ivf = faiss.extract_index_ivf(index)  #
-    index_ivf.nprobe = 1
-    index.train(big_npy)
-    batch_size_add = 8192
-    for i in range(0, big_npy.shape[0], batch_size_add):
-        index.add(big_npy[i : i + batch_size_add])
-    # faiss.write_index(
-    #     index,
-    #     f"added_{spk_name}.index"
-    # )
-    print("Successfully build index")
-    return index
-
-
-def compute_index(
-    hubert_embeddings,
-):  # from: RVC
-    npys = []
-    for embedding in hubert_embeddings:
-        phone = embedding[0].transpose(-1, -2).cpu().numpy()
-        npys.append(phone)
-    big_npy = np.concatenate(npys, 0)
-    big_npy_idx = np.arange(big_npy.shape[0])
-    np.random.shuffle(big_npy_idx)
-    big_npy = big_npy[big_npy_idx]
-
-    if big_npy.shape[0] > 2e5:
-        # if(1):
-        info = "Trying doing kmeans %s shape to 10k centers." % big_npy.shape[0]
-        logger.info(info)
-        try:
-            big_npy = (
-                MiniBatchKMeans(
-                    n_clusters=10000,
-                    verbose=True,
-                    batch_size=256 * 2,
-                    compute_labels=False,
-                    init="random",
-                )
-                .fit(big_npy)
-                .cluster_centers_
-            )
-        except:
-            info = traceback.format_exc()
-            logger.warning(info)
-
-    n_ivf = min(int(16 * np.sqrt(big_npy.shape[0])), big_npy.shape[0] // 39)
-    index = faiss.index_factory(big_npy.shape[1], "IVF%s,Flat" % n_ivf)
-    index_ivf = faiss.extract_index_ivf(index)  #
-    index_ivf.nprobe = 1
-    index.train(big_npy)
-    batch_size_add = 8192
-    for i in range(0, big_npy.shape[0], batch_size_add):
-        index.add(big_npy[i : i + batch_size_add])
-    # faiss.write_index(
-    #     index,
-    #     f"added_{spk_name}.index"
-    # )
-    return index
 
 
 class HParams:

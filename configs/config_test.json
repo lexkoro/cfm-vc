@@ -5,19 +5,19 @@
     "epochs": 1000,
     "seed": 1234,
     "port": "8001",
-    "batch_size": 16,
-    "num_workers": 8,
+    "batch_size": 24,
+    "num_workers": 4,
     "fp16_run": true,
     "half_type": "fp16",
     "accumulate_grad_batches": 1,
     "gradient_clip_val": 1.0,
     "keep_ckpts": 5,
     "reset_optimizer": false,
-    "checkpoint_restore_path": null,
+    "checkpoint_restore_path": "/home/alex/Projekt/cfm-vc/cfm-vc/ipglwc26/checkpoints/last.ckpt",
     "betas": [0.8, 0.99],
     "eps": 1e-9,
     "schedule_params": {
-      "warmup_steps": 3000,
+      "warmup_steps": 1000,
       "decay_steps": 200000,
       "max_lr": 2e-4,
       "min_lr": 5e-5
@@ -32,30 +32,28 @@
     "hop_length": 480,
     "n_mel_channels": 100,
     "mel_padding": "same",
-    "unit_vocab_size": 500,
+    "unit_vocab_size": 128,
     "unit_path_mode": "sidecar",
     "allow_resample": true
   },
   "model": {
     "encoder": {
-      "hidden_channels": 256,
+      "hidden_channels": 192,
       "n_layers": 6,
-      "n_heads": 4,
-      "dim_head": 64,
-      "filter_channels": 1024,
+      "n_heads": 2,
+      "dim_head": 96,
+      "filter_channels": 768,
       "p_dropout": 0.1,
       "kernel_size": 15
     },
     "decoder": {
-      "hidden_channels": 256,
+      "hidden_channels": 192,
       "n_layers": 16,
-      "n_heads": 4,
-      "dim_head": 64,
-      "filter_channels": 1024,
+      "n_heads": 2,
+      "dim_head": 96,
+      "filter_channels": 768,
       "dropout": 0.05,
-      "kernel_size": 3,
-      "mask_frac_lengths": [0.1, 0.4],
-      "mask_from_start_prob": 0.7
+      "kernel_size": 15
     }
   },
   "inference": {

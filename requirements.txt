@@ -16,6 +16,7 @@ fairseq
 librosa
 tensorboard
 tensorboardX
+wandb
 transformers
 langdetect
 pyyaml

@@ -1,239 +1,192 @@
+import os
 import random
 from pathlib import Path
 
+import librosa
 import numpy as np
 import torch
 import torch.utils.data
-from torch.utils.data import WeightedRandomSampler
 
-import utils
-from modules.mel_processing import mel_spectrogram_torch
-from utils import load_filepaths_and_text, load_wav_to_torch, mel_to_energy
+from modules.mel_processing import MelSpectrogramFeatures
 
-# import h5py
+PATH_PLACEHOLDER = "<replace_this_path>"
 
 
-"""Multi speaker version"""
+def _get(hparams, key, default=None):
+    value = getattr(hparams, key, default)
+    return default if value is None else value
 
 
-class TextAudioSpeakerLoader(torch.utils.data.Dataset):
-    """
-    1) loads audio, speaker_id, text pairs
-    2) normalizes text and converts them to sequences of integers
-    3) computes spectrograms from audio files.
-    """
+def _discover_metadata_files(metadata_root: Path, patterns):
+    """Discover and deduplicate metadata CSV files under *metadata_root*."""
+    if isinstance(patterns, str):
+        patterns = [patterns]
 
-    def __init__(self, audiopaths, hparams, all_in_mem: bool = False):
-        self.audiopaths = load_filepaths_and_text(audiopaths)
-        self.hparams = hparams
-        self.max_wav_value = hparams.data.max_wav_value
-        self.sampling_rate = hparams.data.sampling_rate
-        self.filter_length = hparams.data.filter_length
-        self.hop_length = hparams.data.hop_length
-        self.win_length = hparams.data.win_length
-        self.unit_interpolate_mode = hparams.data.unit_interpolate_mode
-        self.sampling_rate = hparams.data.sampling_rate
-        self.use_sr = hparams.train.use_sr
-        self.spec_len = hparams.train.max_speclen
-        self.num_mels = hparams.data.n_mel_channels
-        self.mel_fmin = hparams.data.mel_fmin
-        self.mel_fmax = hparams.data.mel_fmax
-        # self.min_file_length = hparams.data.min_file_length * self.sampling_rate
-        # self.max_file_length = hparams.data.max_file_length * self.sampling_rate
-        self.num_frames = int(4 * self.sampling_rate // self.hop_length)
+    metadata_files = []
+    for pattern in patterns:
+        metadata_files.extend(metadata_root.glob(pattern))
 
-        random.seed(1234)
-        random.shuffle(self.audiopaths)
+    metadata_files = sorted(
+        {path.resolve() for path in metadata_files if path.is_file()}
+    )
+    if not metadata_files:
+        raise FileNotFoundError(
+            f"No metadata CSV found under {metadata_root} with patterns: {patterns}"
+        )
+    return metadata_files
 
-        self.all_in_mem = all_in_mem
-        if self.all_in_mem:
-            self.cache = [self.get_audio(p[0]) for p in self.audiopaths]
 
-        self.audiopaths = self._filter_long_files(self.audiopaths)
+def _resolve_audio_path(metadata_root: Path, raw_path: str) -> str:
+    """Resolve a raw path from a metadata CSV to an absolute path."""
+    path = raw_path.replace("\\", "/").strip()
+    root_str = str(metadata_root)
+    if PATH_PLACEHOLDER in path:
+        path = path.replace(PATH_PLACEHOLDER, root_str)
+    elif not os.path.isabs(path):
+        path = os.path.join(root_str, path)
+    return os.path.abspath(os.path.expanduser(path))
 
-    def _filter_long_files(self, audio_paths):
-        filtered = []
 
-        # for p, speaker in audio_paths:
-        #     if (
-        #         self.min_file_length
-        #         < (Path(p).stat().st_size // 2)
-        #         < self.max_file_length
-        #     ):
-        #         filtered.append([p, speaker])
+class UnitMelLoader(torch.utils.data.Dataset):
+    """Loads frame-aligned raw k-means units and mel spectrograms."""
 
-        self.unique_speaker_count = len(set([x[1] for x in audio_paths]))
+    def __init__(self, phase: str, hparams, verbose=False):
+        root_path = hparams.root_path
+        self.metadata_root = Path(os.path.abspath(os.path.expanduser(root_path)))
+        if not self.metadata_root.exists():
+            raise FileNotFoundError(
+                f"Dataset root_path does not exist: {self.metadata_root}"
+            )
 
-        print("Unique speakers:", self.unique_speaker_count)
-        print("Audiopaths before filtering:", len(audio_paths))
-        # print("Audiopaths after filtering:", len(filtered))
+        self.phase = phase
+        self.verbose = verbose
+        self.sampling_rate = hparams.sampling_rate
+        self.hop_length = hparams.hop_length
+        self.unit_path_mode = _get(hparams, "unit_path_mode", "sidecar")
+        self.allow_resample = _get(hparams, "allow_resample", True)
 
-        return audio_paths
+        codes_root_path = _get(hparams, "codes_root_path", None)
+        self.codes_root = (
+            Path(os.path.abspath(os.path.expanduser(codes_root_path)))
+            if codes_root_path is not None
+            else None
+        )
+
+        self.mel_extractor = MelSpectrogramFeatures(
+            sample_rate=hparams.sampling_rate,
+            n_fft=hparams.filter_length,
+            hop_length=hparams.hop_length,
+            n_mels=hparams.n_mel_channels,
+            padding=_get(hparams, "mel_padding", "same"),
+        )
+
+        metadata_glob = _get(hparams, "metadata_glob", "*/*_metadata.csv")
+        metadata_files = _discover_metadata_files(self.metadata_root, metadata_glob)
+        if self.verbose:
+            print(f"[UnitMelLoader] Found {len(metadata_files)} metadata file(s)")
+
+        self.audio_paths = self._parse_metadata(metadata_files)
+
+        rng = random.Random(_get(hparams, "seed", 1234))
+        rng.shuffle(self.audio_paths)
+
+        val_samples = int(_get(hparams, "val_samples", 4))
+        val_indices = set(
+            rng.sample(
+                range(len(self.audio_paths)), min(val_samples, len(self.audio_paths))
+            )
+        )
+        if phase == "val":
+            self.audio_paths = [
+                path for idx, path in enumerate(self.audio_paths) if idx in val_indices
+            ]
+
+        if self.verbose:
+            print(f"[UnitMelLoader:{phase}] {len(self.audio_paths)} samples")
+
+    def _parse_metadata(self, metadata_files):
+        entries = []
+        for metadata_file in metadata_files:
+            with open(metadata_file, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    raw_path = line.split("|", 1)[0]
+                    entries.append(_resolve_audio_path(self.metadata_root, raw_path))
+        return list(dict.fromkeys(entries))
+
+    def _build_units_path(self, audio_path: str) -> Path:
+        if self.unit_path_mode == "sidecar":
+            return Path(audio_path).with_suffix(".npy")
+        if self.unit_path_mode == "mirror":
+            if self.codes_root is None:
+                raise ValueError(
+                    "codes_root_path is required for mirror unit_path_mode"
+                )
+            rel = os.path.relpath(audio_path, self.metadata_root)
+            return self.codes_root / Path(rel).with_suffix(".npy")
+        raise ValueError(f"Unknown unit_path_mode: {self.unit_path_mode}")
 
     def get_audio(self, filename):
-        # filename = filename.replace("\\", "/")
-        filename, speaker_id = filename
-        audio, sampling_rate = load_wav_to_torch(filename)
-        if sampling_rate != self.sampling_rate:
-            raise ValueError(
-                "Sample Rate not match. Expect {} but got {} from {}".format(
-                    self.sampling_rate, sampling_rate, filename
+        try:
+            target_sr = self.sampling_rate if self.allow_resample else None
+            audio, sampling_rate = librosa.load(filename, sr=target_sr, mono=True)
+
+            if sampling_rate != self.sampling_rate:
+                raise ValueError(
+                    f"{sampling_rate} SR doesn't match target {self.sampling_rate} SR"
                 )
-            )
-        audio_norm = audio / self.max_wav_value
-        audio_norm = audio_norm.unsqueeze(0)
 
-        # compute mel spectrogram
-        spec = mel_spectrogram_torch(
-            audio_norm,
-            self.filter_length,
-            self.num_mels,
-            self.sampling_rate,
-            self.hop_length,
-            self.win_length,
-            self.mel_fmin,
-            self.mel_fmax,
-        )
+            data = torch.from_numpy(audio).float().unsqueeze(0)
 
-        spec = torch.squeeze(spec, 0)
+            mel = self.mel_extractor(data).squeeze(0)
+        except Exception as err:
+            print(err)
+            print(filename)
+            raise
 
-        # load f0 and uv
-        f0_path = filename.replace(".wav", ".rmvpe.pt")
-        loaded_data = torch.load(f0_path)
-        f0 = loaded_data["f0"].unsqueeze(0)
-        uv = loaded_data["uv"]
+        return mel
 
-        # load hubert
-        hubert_path = filename.replace(".wav", ".soft.pt")
-        c = torch.load(hubert_path)
-        c = utils.repeat_expand_2d(
-            c.squeeze(0), f0.shape[1], mode=self.unit_interpolate_mode
-        )
+    def _load_units(self, audio_path: str):
+        units_path = self._build_units_path(audio_path)
+        if not units_path.is_file():
+            raise FileNotFoundError(f"Missing unit file for {audio_path}: {units_path}")
 
-        # perturbate c randomly with noise and weight randomly
-        if random.random() < 0.3:
-            c = c + torch.randn_like(c)
-
-        lmin = min(c.size(-1), spec.size(-1))
-        assert abs(c.size(-1) - spec.size(-1)) < 3, (
-            c.size(-1),
-            spec.size(-1),
-            filename,
-        )
-        assert abs(audio_norm.shape[1] - lmin * self.hop_length) < 3 * self.hop_length
-        spec, c, f0, uv = (
-            spec[:, :lmin],
-            c[:, :lmin],
-            f0[:, :lmin],
-            uv[:lmin],
-        )
-        audio_norm = audio_norm[:, : lmin * self.hop_length]
-
-        # speaker id
-        speaker_id = torch.LongTensor([int(speaker_id)])
-
-        return c, f0, spec, audio_norm, uv, speaker_id
-
-    def random_slice(self, c, f0, spec, audio_norm, uv, speaker_id):
-        if spec.shape[1] > self.num_frames:
-            start = random.randint(0, spec.shape[1] - self.num_frames)
-            end = start + self.num_frames - 1
-            spec, c, f0, uv = (
-                spec[:, start:end],
-                c[:, start:end],
-                f0[:, start:end],
-                uv[start:end],
-            )
-            audio_norm = audio_norm[:, start * self.hop_length : end * self.hop_length]
-
-        return c, f0, spec, audio_norm, uv, speaker_id
+        units = torch.from_numpy(np.load(units_path)).long().squeeze()
+        if units.ndim != 1:
+            raise ValueError(f"Expected 1D unit ids in {units_path}, got {units.shape}")
+        return units
 
     def __getitem__(self, index):
-        if self.all_in_mem:
-            return self.random_slice(*self.cache[index])
-        else:
-            return self.random_slice(*self.get_audio(self.audiopaths[index]))
+        audio_path = self.audio_paths[index]
+        mel = self.get_audio(audio_path)
+        units = self._load_units(audio_path)
+
+        # repair mel by cropping to match unit length, if needed
+        unit_len = units.size(-1)
+        mel = mel[:, :unit_len]
+
+        return {
+            "mel": mel,
+            "units": units,
+        }
 
     def __len__(self):
-        return len(self.audiopaths)
+        return len(self.audio_paths)
 
+    def collate_fn(self, batch):
+        units = [item["units"] for item in batch]
+        mels = [item["mel"] for item in batch]
 
-class TextAudioCollate:
-    def __call__(self, batch):
-        batch = [b for b in batch if b is not None]
+        unit_lengths = torch.tensor([u.size(-1) for u in units], dtype=torch.long)
+        mel_lengths = torch.tensor([m.size(-1) for m in mels], dtype=torch.long)
 
-        input_lengths, ids_sorted_decreasing = torch.sort(
-            torch.LongTensor([x[0].shape[1] for x in batch]), dim=0, descending=True
+        units_padded = torch.nested.to_padded_tensor(
+            torch.nested.nested_tensor(units, layout=torch.jagged), padding=0
+        )
+        mels_padded = torch.nested.to_padded_tensor(
+            torch.nested.nested_tensor(mels, layout=torch.jagged), padding=0
         )
 
-        max_c_len = max([x[0].size(1) for x in batch])
-        max_wav_len = max([x[3].size(1) for x in batch])
-
-        lengths = torch.LongTensor(len(batch))
-        sid = torch.LongTensor(len(batch))
-
-        c_padded = torch.FloatTensor(len(batch), batch[0][0].shape[0], max_c_len)
-        f0_padded = torch.FloatTensor(len(batch), 1, max_c_len)
-        spec_padded = torch.FloatTensor(len(batch), batch[0][2].shape[0], max_c_len)
-        wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
-        uv_padded = torch.FloatTensor(len(batch), max_c_len)
-
-        c_padded.zero_()
-        spec_padded.zero_()
-        f0_padded.zero_()
-        wav_padded.zero_()
-        uv_padded.zero_()
-
-        for i in range(len(ids_sorted_decreasing)):
-            row = batch[ids_sorted_decreasing[i]]
-
-            c = row[0]
-            c_padded[i, :, : c.size(1)] = c
-            lengths[i] = c.size(1)
-
-            f0 = row[1]
-            f0_padded[i, 0, : f0.size(1)] = f0
-
-            spec = row[2]
-            spec_padded[i, :, : spec.size(1)] = spec
-
-            wav = row[3]
-            wav_padded[i, :, : wav.size(1)] = wav
-
-            uv = row[4]
-            uv_padded[i, : uv.size(0)] = uv
-
-            sid[i] = row[5]
-
-        return (
-            c_padded,
-            f0_padded,
-            spec_padded,
-            wav_padded,
-            lengths,
-            uv_padded,
-            sid,
-        )
-
-
-def get_weighted_sampler(items):
-    dataset_samples_weight = 1.0
-
-    speaker_names = np.array([item[1] for item in items])
-    unique_speaker_names = np.unique(speaker_names).tolist()
-    speaker_ids = [unique_speaker_names.index(l) for l in speaker_names]
-    speaker_count = np.array(
-        [len(np.where(speaker_names == l)[0]) for l in unique_speaker_names]
-    )
-    weight_speaker = 1.0 / speaker_count
-
-    speaker_samples_weight = np.array(
-        np.array([weight_speaker[l] for l in speaker_ids])
-    )
-    speaker_samples_weight = speaker_samples_weight / np.linalg.norm(
-        speaker_samples_weight
-    )
-    speaker_samples_weight = torch.from_numpy(speaker_samples_weight).float()
-    dataset_samples_weight += speaker_samples_weight * 2.0
-
-    return WeightedRandomSampler(dataset_samples_weight, len(dataset_samples_weight))
+        return (units_padded, unit_lengths, mels_padded, mel_lengths)

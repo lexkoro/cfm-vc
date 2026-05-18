@@ -348,6 +348,8 @@ and can potentially gain:
 - codec path is based on `24 kHz` audio and hop `480`
 - local stripped codec checkpoint is decode-only
 
+The repo-specific codec-prediction adaptation path is documented separately in `llm_vc_approach.md`.
+
 ## High-Value Facts To Preserve For Later
 
 - EZ-VC uses `Xeus layer 14`, not the final layer.

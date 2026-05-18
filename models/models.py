@@ -1,252 +1,185 @@
 import torch
 from torch import nn
 
-import modules.commons as commons
 from modules.cfm.flow_matching import ConditionalFlowMatching
+from modules.commons import rand_span_mask, sequence_mask
 from modules.content_encoder import ContentEncoder
-from modules.perceiver_encoder import PerceiverResampler
-from modules.reversal_classifer import SpeakerClassifier
 
 
-class SynthesizerTrn(nn.Module):
+def _get(config, key, default=None):
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        value = config.get(key, default)
+    else:
+        value = getattr(config, key, default)
+    return default if value is None else value
+
+
+class GameVC(nn.Module):
     """
-    Synthesizer for Training
+    Game Voice Conversion Model
     """
 
     def __init__(
         self,
         spec_channels,
-        hidden_channels,
-        filter_channels,
-        n_heads,
-        dim_head,
-        n_layers,
-        kernel_size,
-        p_dropout,
-        speaker_embedding,
-        n_speakers,
-        ssl_dim,
+        unit_vocab_size=500,
+        encoder=None,
+        decoder=None,
+        hidden_channels=None,
+        filter_channels=None,
+        n_heads=None,
+        dim_head=None,
+        n_layers=None,
+        kernel_size=None,
+        p_dropout=None,
         **kwargs,
     ):
         super().__init__()
         self.spec_channels = spec_channels
-        self.hidden_channels = hidden_channels
-        self.filter_channels = filter_channels
-        self.n_heads = n_heads
-        self.dim_head = dim_head
-        self.n_layers = n_layers
-        self.kernel_size = kernel_size
-        self.p_dropout = p_dropout
-        self.speaker_embedding = speaker_embedding
-        self.n_speakers = n_speakers
-        self.ssl_dim = ssl_dim
+
+        self.encoder_hidden_channels = _get(
+            encoder,
+            "hidden_channels",
+            _get(encoder, "hidden_dim", hidden_channels or 256),
+        )
+        self.encoder_filter_channels = _get(
+            encoder, "filter_channels", filter_channels or 1024
+        )
+        self.encoder_n_heads = _get(encoder, "n_heads", n_heads or 4)
+        self.encoder_dim_head = _get(encoder, "dim_head", dim_head)
+        self.encoder_n_layers = _get(encoder, "n_layers", n_layers or 6)
+        self.encoder_kernel_size = _get(
+            encoder, "kernel_size", _get(encoder, "conv_kernel_size", kernel_size or 15)
+        )
+        self.encoder_p_dropout = _get(encoder, "p_dropout", p_dropout or 0.1)
+
+        self.decoder_hidden_channels = _get(
+            decoder,
+            "hidden_channels",
+            _get(
+                decoder, "hidden_dim", hidden_channels or self.encoder_hidden_channels
+            ),
+        )
+        self.decoder_filter_channels = _get(
+            decoder, "filter_channels", filter_channels or self.encoder_filter_channels
+        )
+        self.decoder_n_heads = _get(decoder, "n_heads", n_heads or self.encoder_n_heads)
+        self.decoder_dim_head = _get(decoder, "dim_head", self.encoder_dim_head)
+        self.decoder_n_layers = _get(
+            decoder, "n_layers", n_layers or self.encoder_n_layers
+        )
+        self.decoder_kernel_size = _get(
+            decoder,
+            "kernel_size",
+            _get(decoder, "conv_kernel_size", kernel_size or self.encoder_kernel_size),
+        )
+        self.decoder_p_dropout = _get(
+            decoder,
+            "p_dropout",
+            _get(decoder, "dropout", p_dropout or 0.05),
+        )
 
         # content encoder
         self.content_encoder = ContentEncoder(
-            hidden_channels=hidden_channels,
-            ssl_dim=ssl_dim,
-            filter_channels=filter_channels,
-            n_heads=n_heads,
-            dim_head=dim_head,
-            n_layers=n_layers,
-            kernel_size=kernel_size,
-            p_dropout=p_dropout,
-        )
-
-        # Speaker Encoder
-        self.speaker_encoder = PerceiverResampler(
-            in_channels=spec_channels,
-            hidden_channels=hidden_channels,
-            n_layers=2,
-            num_latents=32,
-            dim_head=dim_head,
-            n_heads=n_heads,
-            ff_mult=4,
-            p_dropout=p_dropout,
+            num_units=unit_vocab_size,
+            hidden_channels=self.encoder_hidden_channels,
+            filter_channels=self.encoder_filter_channels,
+            n_heads=self.encoder_n_heads,
+            dim_head=self.encoder_dim_head,
+            n_layers=self.encoder_n_layers,
+            kernel_size=self.encoder_kernel_size,
+            p_dropout=self.encoder_p_dropout,
         )
 
         # spec decoder
         self.decoder = ConditionalFlowMatching(
-            estimator_params={
-                "in_channels": spec_channels + hidden_channels,
-                "hidden_channels": hidden_channels,
-                "out_channels": spec_channels,
-                "filter_channels": filter_channels,
-                "dropout": 0.05,
-                "n_layers": 8,
-                "n_heads": n_heads,
-                "dim_head": dim_head,
-                "kernel_size": kernel_size,
-            },
+            in_channels=self.encoder_hidden_channels + (2 * self.spec_channels),
+            hidden_channels=self.decoder_hidden_channels,
+            filter_channels=self.decoder_filter_channels,
+            out_channels=self.spec_channels,
+            n_layers=self.decoder_n_layers,
+            n_heads=self.decoder_n_heads,
+            dim_head=self.decoder_dim_head,
+            kernel_size=self.decoder_kernel_size,
+            p_dropout=self.decoder_p_dropout,
+            use_skip_connections=False,
         )
 
-    def forward(self, c, f0, uv, spec, c_lengths=None):
-        # if self.n_speakers > 1 and self.speaker_embedding:
-        #     g = F.normalize(g).unsqueeze(-1)
+    def forward(self, units, units_lengths, mel, mel_lengths):
+        # Mask
+        x_mask = sequence_mask(units_lengths, units.size(1)).unsqueeze(1).to(mel.dtype)
 
-        # x_mask
-        x_mask = torch.unsqueeze(commons.sequence_mask(c_lengths, c.size(2)), 1).to(
-            c.dtype
+        # Encoder
+        unit_features = self.content_encoder(units, x_mask)
+
+        # Build a prefix prompt mask so training matches inference conditioning.
+        prompt_mask = rand_span_mask(
+            mel, mel_lengths, frac_lengths=(0.1, 0.4), from_start=True
         )
 
-        # speaker encoder
-        speaker_cond, speaker_cond_mask = self.speaker_encoder(spec, x_mask)
-
-        # content encoder
-        x_speaker_classifier, mu_y, f0_pred, lf0 = self.content_encoder(
-            c,
-            x_mask,
-            cond=speaker_cond,
-            cond_mask=speaker_cond_mask,
-            f0=f0,
-            uv=uv,
+        # Decoder
+        diff_loss, estimator_pred, generation_mask = self.decoder.forward(
+            x1=mel,
+            mask=x_mask,
+            mu=unit_features,
+            prompt_mask=prompt_mask,
         )
+        mel_generated = mel * generation_mask.to(mel.dtype)
 
-        # # speaker classifier
-        # speaker_logits = self.speaker_classifier(x_speaker_classifier, x_mask)
-
-        # Compute loss of score-based decoder
-        diff_loss, estimator_pred = self.decoder.forward(
-            spec,
-            x_mask,
-            mu_y,
-            spk=None,
-            cond=speaker_cond,
-            cond_mask=speaker_cond_mask,
-        )
-
-        return (diff_loss, f0_pred, lf0)
+        return diff_loss, estimator_pred, mel_generated
 
     @torch.no_grad()
     def infer(
         self,
-        c,
-        spec,
-        f0,
-        uv,
+        source_units,
+        target_units,
+        target_mel,
+        source_lengths,
+        target_lengths,
         n_timesteps=10,
         temperature=1.0,
         guidance_scale=0.0,
         solver="euler",
     ):
-        # if self.n_speakers > 1 and self.speaker_embedding:
-        #     g = F.normalize(g).unsqueeze(-1)
+        source_max_len = int(source_lengths.max().item())
+        target_max_len = int(target_lengths.max().item())
 
-        c_lengths = (torch.ones(c.size(0)) * c.size(-1)).to(c.device)
+        source_units = source_units[:, :source_max_len]
+        target_units = target_units[:, :target_max_len]
+        target_mel = target_mel[:, :, :target_max_len]
 
-        # x mask
-        x_mask = torch.unsqueeze(commons.sequence_mask(c_lengths, c.size(2)), 1).to(
-            c.dtype
+        # concat source and target units, and create corresponding mask
+        units = torch.cat([target_units, source_units], dim=-1)
+
+        # combine target and source lengths
+        combined_lengths = target_lengths + source_lengths
+
+        x_mask = (
+            sequence_mask(combined_lengths, units.size(1))
+            .unsqueeze(1)
+            .to(target_mel.dtype)
         )
 
-        # speaker encoder
-        speaker_cond, speaker_cond_mask = self.speaker_encoder(spec, x_mask)
+        # Encoder
+        unit_features = self.content_encoder(units, x_mask)
 
-        # content encoder
-        x_speaker_classifier, mu_y, *_ = self.content_encoder(
-            c,
-            x_mask,
-            cond=speaker_cond,
-            cond_mask=speaker_cond_mask,
-            f0=f0,
-            uv=uv,
-        )
-
-        z = (
-            torch.randn(
-                size=(mu_y.shape[0], self.spec_channels, mu_y.shape[2]),
-                dtype=mu_y.dtype,
-                device=mu_y.device,
-            )
-            * temperature
-        )
-
+        # Decoder
         decoder_outputs = self.decoder.inference(
-            z,
-            x_mask,
-            mu_y,
-            n_timesteps,
-            spk=None,
-            cond=speaker_cond,
-            cond_mask=speaker_cond_mask,
+            mu=unit_features,
+            mask=x_mask,
+            target_condition=target_mel,
+            source_lengths=source_lengths,
+            target_lengths=target_lengths,
+            temperature=temperature,
+            n_timesteps=n_timesteps,
             guidance_scale=guidance_scale,
             solver=solver,
         )
 
-        return decoder_outputs, None
+        # Cut the condition part from the output
+        start = int(target_lengths[0].item())
+        decoder_outputs = decoder_outputs[:, :, start:]
 
-    @torch.no_grad()
-    def vc(
-        self,
-        c,
-        cond,
-        cond_mask,
-        f0,
-        uv,
-        n_timesteps=10,
-        temperature=1.0,
-        guidance_scale=0.0,
-        solver="euler",
-    ):
-        # if self.n_speakers > 1 and self.speaker_embedding:
-        #     g = F.normalize(g).unsqueeze(-1)
-
-        c_lengths = (torch.ones(c.size(0)) * c.size(-1)).to(c.device)
-
-        # x mask
-        x_mask = torch.unsqueeze(commons.sequence_mask(c_lengths, c.size(2)), 1).to(
-            c.dtype
-        )
-
-        # content encoder
-        mu_y = self.content_encoder.vc(
-            c,
-            x_mask,
-            cond=cond,
-            cond_mask=cond_mask,
-            f0=f0,
-            uv=uv,
-        )
-
-        z = (
-            torch.randn(
-                size=(mu_y.shape[0], self.spec_channels, mu_y.shape[2]),
-                dtype=mu_y.dtype,
-                device=mu_y.device,
-            )
-            * temperature
-        )
-
-        decoder_outputs = self.decoder.inference(
-            z,
-            x_mask,
-            mu_y,
-            n_timesteps,
-            spk=None,
-            cond=cond,
-            cond_mask=cond_mask,
-            guidance_scale=guidance_scale,
-            solver=solver,
-        )
-
-        return decoder_outputs, None
-
-    @torch.no_grad()
-    def compute_conditional_latent(self, mels, mel_lengths):
-        latents_embeddings = []
-        for mel, length in zip(mels, mel_lengths):
-            x_mask = torch.unsqueeze(commons.sequence_mask(length, mel.size(2)), 1).to(
-                mel.dtype
-            )
-
-            # reference mel encoder and perceiver latents
-            # speaker encoder
-            speaker_cond, speaker_cond_mask = self.speaker_encoder(mel, x_mask)
-            latents_embeddings.append(speaker_cond.squeeze(0))
-
-        latents_embedding = torch.stack(latents_embeddings, dim=0)
-
-        # mean pooling for cond_latents and speaker_embeddings
-        latents_embedding = latents_embedding.mean(dim=0, keepdim=True)
-
-        return latents_embedding, speaker_cond_mask
+        return decoder_outputs
